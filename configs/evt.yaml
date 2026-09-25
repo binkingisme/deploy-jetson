@@ -1,0 +1,19 @@
+# ============================================================
+# EVT / GPD configuration for open-set decision
+# THESE PARAMETERS ARE FIT OFFLINE (workstation), NOT at runtime.
+# Runtime only does dict lookup from threshold_table.json (FR-006).
+# ============================================================
+
+evt:
+  mode: "identity_gpd"               # fixed | global_evt | identity_gpd
+  u_quantile: 0.98
+  alpha: 0.05
+  min_exceedances: 5
+  tail_threshold: 0.5
+  confidence_interval: 0.95
+  random_state: 42
+
+gpd:
+  method: "mom"                      # max_likelihood | mom | pwm
+  shape_range: [-0.5, 0.5]
+  location: 0.0

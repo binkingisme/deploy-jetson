@@ -1,0 +1,25 @@
+[project]
+name = "face-ai"
+version = "0.1.0"
+description = "Open-Set Face Recognition service (Jetson Orin Nano, Phase 0-5)"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+
+# All runtime deps are pinned in requirements.txt (Jetson-friendly).
+# Dependencies managed via pip (JetPack Python is system-wide).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 88
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.8"
+ignore_missing_imports = true

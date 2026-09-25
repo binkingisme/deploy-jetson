@@ -1,0 +1,21 @@
+# MediaMTX Configuration for Jetson Face Recognition WebRTC
+# Spec Section 17 & 18
+logLevel: info
+logDestinations: [stdout]
+
+# RTSP Configuration
+rtsp: yes
+rtspAddress: :8554
+
+# WebRTC (WHEP / WHIP) Configuration
+webrtc: yes
+webrtcAddress: :8889
+webrtcEncryption: no
+webrtcAllowStreamPush: yes
+
+# HLS Fallback Configuration
+hls: yes
+hlsAddress: :8888
+
+paths:
+  all_others: {}

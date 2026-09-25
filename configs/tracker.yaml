@@ -1,0 +1,14 @@
+# ============================================================
+# Multi-object tracker configuration (FR-006)
+# ============================================================
+
+tracker:
+  type: "nvdcf"                      # nvdcf | iou
+  enable: true
+  width: 640
+  height: 480
+  ll_lib_file: "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"
+  ll_config_file: "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml"
+  gpu_id: 0
+  max_batch_size: 0
+  compute_hw: 0

@@ -1,0 +1,86 @@
+# ============================================================
+# Camera configuration (FR-001) — multi-camera support
+#
+# The pipeline launches one DeepStream engine per entry in `cameras`.
+# `camera` is kept as the legacy single-camera alias (used when the
+# `cameras` list is absent).
+# ============================================================
+
+cameras:
+  - id: "camera_01"
+    code: "CAM-FRONT-01"
+    name: "Front Door Camera"
+    source_type: "rtsp"                  # csi | rtsp
+    sensor_id: 0
+    width: 1920
+    height: 1080
+    fps: 30
+
+    # --- RTSP source (only when source_type: rtsp) ---
+    uri: "rtsp://admin:Nckh%402025@10.39.4.64:554/stream"
+    protocol: "tcp"                    # tcp | udp
+    latency_ms: 1000                 # buffer rtspsrc: cao hơn để hấp thụ jitter mạng, tránh vỡ hình
+    codec: "h265"                      # h264 | h265 — camera này dùng H.265
+
+    # --- DeepStream source element ---
+    deepstream:
+      source_element: "rtspsrc"   # csi | rtsp
+      sensor_mode: 3
+      bufapi_version: false
+
+  - id: "camera_02"
+    code: "CAM-CSI-01"
+    name: "Jetson CSI Camera"
+    source_type: "csi"                   # csi | rtsp
+    sensor_id: 0
+    width: 1920
+    height: 1080
+    fps: 30
+
+    uri: ""                             # không dùng cho CSI
+    protocol: "tcp"
+    latency_ms: 300
+    codec: "h265"
+
+    # --- DeepStream source element ---
+    deepstream:
+      source_element: "csi"        # csi | rtsp
+      sensor_mode: 3
+      bufapi_version: false
+
+    # --- CSI ISP tuning (nvarguscamerasrc properties, CSI only) ---
+    # Mục tiêu: giảm mờ (ee), tăng sáng (exposurecomp/gain), màu chuẩn (wb/saturation)
+    # Verify range: ee-strength [-1..1], exposurecompensation [-2..2], saturation [0..2]
+    csi_tuning:
+      wbmode: 1                    # 1=auto | 5=daylight | 6=cloudy-daylight
+      saturation: 1.2              # hơi đậm màu hơn (0..2)
+      ee-mode: 2                   # 2=HighQuality edge enhancement (chống mờ)
+      ee-strength: 0.6             # mức tăng nét
+      tnr-mode: 2                  # 2=HighQuality temporal noise reduction (thu sáng)
+      exposurecompensation: 1.5    # tăng sáng chủ động (+)
+      gainrange: "1 10.625"        # analog gain (sensor max 10.625)
+      ispdigitalgainrange: "1 8"   # ISP digital gain
+      aeantibanding: 2             # 2=50Hz chống nhấp nháy đèn điện
+
+# --- Legacy alias (single-camera) — mantained for backward compat ---
+camera:
+  id: "camera_01"
+  code: "CAM-FRONT-01"
+  name: "Front Door Camera"
+  source_type: "rtsp"                  # csi | rtsp
+  sensor_id: 0
+  width: 1920
+  height: 1080
+  fps: 30
+
+  # --- RTSP source (only when source_type: rtsp) ---
+  uri: "rtsp://admin:Nckh%402025@10.39.4.64:554/stream"
+  protocol: "tcp"                    # tcp | udp
+  latency_ms: 1000                   # buffer rtspsrc: cao hơn để hấp thụ jitter mạng, tránh vỡ hình
+  codec: "h265"                      # h264 | h265 — camera này dùng H.265
+
+  # --- DeepStream source element ---
+  deepstream:
+    source_element: "rtspsrc"   # csi | rtsp
+    sensor_mode: 3
+    bufapi_version: false

@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: open_set_fr_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: open_set_fr
+      POSTGRES_USER: open_set_fr
+      POSTGRES_PASSWORD: open_set_fr_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U open_set_fr -d open_set_fr"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+    driver: local

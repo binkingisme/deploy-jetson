@@ -1,0 +1,70 @@
+version: '3.8'
+
+# Graduation Thesis: Edge-based Open-Set Face Recognition on NVIDIA Jetson Orin Nano
+# Deployment Architecture: Spec v3 §18, §20, §21, §40 (Phase 12)
+# Configured with network_mode: host (NVIDIA Jetson / DeepStream official standard)
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: open_set_fr_postgres
+    restart: always
+    network_mode: host
+    environment:
+      POSTGRES_DB: open_set_fr
+      POSTGRES_USER: open_set_fr
+      POSTGRES_PASSWORD: open_set_fr_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U open_set_fr -d open_set_fr"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      network: host
+    container_name: open_set_fr_backend
+    restart: always
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://open_set_fr:open_set_fr_pass@127.0.0.1:5432/open_set_fr
+      JWT_SECRET: super_secret_open_set_fr_jwt_key_2026
+      ENROLLMENT_MIN_BLUR: "100.0"
+      WEBCAM_MIN_BLUR: "35.0"
+    volumes:
+      - ./backend:/app
+      - ./backend/static:/app/static
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      network: host
+    container_name: open_set_fr_frontend
+    restart: always
+    network_mode: host
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: open_set_fr_mediamtx
+    restart: unless-stopped
+    profiles: ["stream"]
+    network_mode: host
+    volumes:
+      - ./configs/mediamtx.yml:/mediamtx.yml
+
+volumes:
+  postgres_data:
+    driver: local

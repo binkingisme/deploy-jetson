@@ -1,0 +1,69 @@
+/* Làm viền màu trắng cho Header theo yêu cầu */
+.custom-header {
+    border-bottom: 3px solid #ffffff;
+}
+
+/* KHU VỰC VIDEO CHÍNH */
+.video-container {
+    /* Đặt chiều cao tương đối bằng 65% màn hình để không bị lố */
+    height: 65vh; 
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
+}
+
+.video-feed {
+    width: 100%;
+    height: 100%;
+    /* object-fit: contain GIÚP GIỮ NGUYÊN TỶ LỆ KHUNG HÌNH CAMERA. 
+       Dù màn hình vuông hay chữ nhật, video không bị kéo giãn hay bóp méo, 
+       chỗ nào dư sẽ có màu nền đen. */
+    object-fit: contain; 
+}
+
+/* Bo góc cho thẻ Card chứa video */
+.video-card {
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+/* TẠO HIỆU ỨNG NHẤP NHÁY CHO CHỮ "LIVE" */
+.pulse-animation {
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.4; }
+    100% { opacity: 1; }
+}
+
+/* TÙY CHỈNH DANH SÁCH MENU BÊN TRÁI */
+/* Trạng thái nút Camera đang được chọn */
+.list-group-item.active {
+    background-color: #e7f1ff !important;
+    border-color: #e7f1ff !important;
+    color: #0d6efd !important;
+    font-weight: bold;
+}
+
+.list-group-item {
+    transition: all 0.2s ease-in-out;
+    border: none;
+}
+
+/* Hiệu ứng di chuột vào (Hover) các nút Camera khác */
+.list-group-item:hover:not(.active) {
+    background-color: #f8f9fa;
+    /* Dịch nhẹ sang phải tạo cảm giác bấm được */
+    transform: translateX(5px); 
+}
+
+/* Hiệu ứng xoay icon khi đóng/mở benchmark dropdown */
+.card-header[aria-expanded="false"] .toggle-icon {
+    transform: rotate(-90deg);
+}
+.toggle-icon {
+    transition: transform 0.3s ease;
+}

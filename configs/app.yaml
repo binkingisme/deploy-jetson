@@ -1,0 +1,41 @@
+# ============================================================
+# App-level configuration for open-set face recognition
+# ============================================================
+
+app:
+  name: "open-set-face-recognition"
+  version: "1.0.0"
+  environment: "production"   # development | production
+
+deepstream:
+  config_dir: "configs/deepstream"
+  primary_gie_config: "configs/deepstream/config_infer_primary.txt"
+  secondary_gie_config: "configs/deepstream/config_infer_secondary.txt"
+
+models:
+  detector:
+    onnx_path: "models/detector/det_10g.onnx"
+    engine_path: "models/detector/det_10g_fp16_4d.engine"
+    input_size: [640, 640]
+    num_classes: 1
+  recognition:
+    onnx_path: "models/recognition/w600k_r50.onnx"
+    engine_path: "models/recognition/face_recog_fp16.engine"
+    input_size: [112, 112]
+    embedding_dim: 512
+
+thresholds:
+  table_path: "thresholds/threshold_table.json"
+
+gallery:
+  model_version: "w600k_r50@1.0.0"
+  embedding_dim: 512
+  load_on_startup: true
+
+postgresql:
+  host: ${POSTGRES_HOST:localhost}
+  port: ${POSTGRES_PORT:5432}
+  dbname: ${POSTGRES_DB:open_set_fr}
+  user: ${POSTGRES_USER:open_set_fr}
+  password: ${POSTGRES_PASSWORD:}
+  sslmode: prefer

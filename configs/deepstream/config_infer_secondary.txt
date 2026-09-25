@@ -1,0 +1,16 @@
+[property]
+gpu-id=0
+net-scale-factor=0.0078125
+offsets=127.5;127.5;127.5
+model-color-format=0
+model-engine-file=../../models/recognition/face_recog_fp16.engine
+labelfile-path=labels.txt
+batch-size=1
+network-mode=0
+num-detected-classes=1
+interval=0
+gie-unique-id=2
+process-mode=1
+network-type=0
+cluster-mode=2
+output-tensor-meta=1

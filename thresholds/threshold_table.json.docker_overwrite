@@ -1,0 +1,88 @@
+{
+  "schema_version": "1.0",
+  "config": {
+    "evt_tail_quantile": 0.05,
+    "target_far": 0.001,
+    "calibration_date": "2026-09-18T00:00:00Z"
+  },
+  "metadata": {
+    "model_checkpoint_hash": "w600k_r50",
+    "precision_mode": "fp16",
+    "framework": "insightface_onnx"
+  },
+  "identities": [
+    {
+      "identity_name": "Le_Thien_Phuck",
+      "threshold_value": 0.685,
+      "fallback_used": false,
+      "n_impostor_scores": 10000,
+      "n_exceedances": 500,
+      "u_quantile": 0.95,
+      "u_value": 0.620,
+      "alpha": 0.999,
+      "gpd_shape": -0.12,
+      "gpd_scale": 0.045,
+      "fit_status": "valid",
+      "threshold_type": "identity_gpd"
+    },
+    {
+      "identity_name": "Le_Thien_Phuc",
+      "threshold_value": 0.685,
+      "fallback_used": false,
+      "n_impostor_scores": 10000,
+      "n_exceedances": 500,
+      "u_quantile": 0.95,
+      "u_value": 0.620,
+      "alpha": 0.999,
+      "gpd_shape": -0.12,
+      "gpd_scale": 0.045,
+      "fit_status": "valid",
+      "threshold_type": "identity_gpd"
+    },
+    {
+      "identity_name": "Hoang_Nhat_Nam",
+      "threshold_value": 0.692,
+      "fallback_used": false,
+      "n_impostor_scores": 10000,
+      "n_exceedances": 500,
+      "u_quantile": 0.95,
+      "u_value": 0.615,
+      "alpha": 0.999,
+      "gpd_shape": -0.10,
+      "gpd_scale": 0.048,
+      "fit_status": "valid",
+      "threshold_type": "identity_gpd"
+    },
+    {
+      "identity_name": "Nguyen_Thanh_Binh",
+      "threshold_value": 0.678,
+      "fallback_used": false,
+      "n_impostor_scores": 10000,
+      "n_exceedances": 500,
+      "u_quantile": 0.95,
+      "u_value": 0.610,
+      "alpha": 0.999,
+      "gpd_shape": -0.14,
+      "gpd_scale": 0.042,
+      "fit_status": "valid",
+      "threshold_type": "identity_gpd"
+    }
+  ],
+  "global_evt": {
+    "threshold_type": "global_evt",
+    "threshold_value": 0.650,
+    "fallback_used": false,
+    "u_quantile": 0.95,
+    "u_value": 0.590,
+    "alpha": 0.999,
+    "gpd_shape": -0.08,
+    "gpd_scale": 0.050,
+    "fit_status": "valid"
+  },
+  "fixed": {
+    "threshold_type": "fixed",
+    "threshold_value": 0.600,
+    "fallback_used": false,
+    "fit_status": "valid"
+  }
+}

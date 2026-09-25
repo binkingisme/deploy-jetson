@@ -1,0 +1,280 @@
+"""Open-set decision logic (FR-006, Section 14).
+
+At runtime this performs threshold-table dict lookup only. The EVT/GPD
+distributions are fit OFFLINE (workstation) and stored in
+identity_thresholds / threshold_table.json (Rule 7: no runtime fitting).
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from ..config.settings import GalleryConfig
+from ..gallery.manager import GalleryManager, GalleryResult
+
+
+@dataclass
+class OpenSetDecision:
+    """Decision result for a single recognition attempt."""
+
+    is_known: bool
+    person_id: str | None
+    person_name: str | None
+    similarity: float
+    threshold: float
+    threshold_type: str
+    fallback_used: bool
+    candidate: GalleryResult | None = None
+
+
+class ThresholdTable:
+    """In-memory threshold table loaded from PostgreSQL / JSON.
+
+    Maps (threshold_type, identity_id) -> threshold value. Runtime dict lookup.
+    Identity IDs are the string labels from the parquet gallery (e.g.
+    ``3137841`` or ``Binh``), matching threshold_table.json ``identity_id``.
+    """
+
+    def __init__(self) -> None:
+        self._table: dict[tuple[str, str | None], float] = {}
+        self._fallback: dict[str, float] = {}
+        self._table_version: str = ""
+        self._model_version: str = ""
+
+    def load_from_json(self, path: str | Path) -> None:
+        """Load thresholds from an offline-produced threshold_table.json.
+
+        Expected schema (schema_version 1.0):
+          {
+            "config": {...},
+            "global_evt": {identity_id, threshold_type, threshold_value, fixed_threshold, ...},
+            "identities": [
+                {identity_id, threshold_type, threshold_value, fixed_threshold, ...},
+                ...
+            ]
+          }
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self._table_version = str(data.get("schema_version", ""))
+        self._table = {}
+        self._fallback = {}
+
+        global_evt = data.get("global_evt") or {}
+        if global_evt:
+            gdid = global_evt.get("identity_id")
+            gd_type = global_evt.get("threshold_type", "global_evt")
+            self._table[(gd_type, gdid)] = float(global_evt["threshold_value"])
+            if "fixed_threshold" in global_evt:
+                self._fallback[gd_type] = float(global_evt["fixed_threshold"])
+
+        for item in data.get("identities") or []:
+            key = (item.get("threshold_type", "identity_gpd"), item.get("identity_id"))
+            self._table[key] = float(item["threshold_value"])
+            if "fixed_threshold" in item:
+                self._fallback[key[0]] = float(item["fixed_threshold"])
+
+    def load_from_db(self, pg_config: Any, model_version: str) -> None:
+        """Load thresholds for a given model version."""
+        import psycopg2
+
+        conn = psycopg2.connect(pg_config.dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT threshold_table_version, identity_id::text,
+                           threshold_type, threshold_value
+                    FROM identity_thresholds
+                    WHERE model_version = %s
+                    """,
+                    (model_version,),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return
+
+        self._model_version = model_version
+        self._table = {}
+        for table_version, identity_id, threshold_type, threshold_value in rows:
+            self._table_version = table_version
+            key = (threshold_type, identity_id)
+            self._table[key] = float(threshold_value)
+
+    def fallback(self, threshold_type: str) -> float | None:
+        """Return the fixed fallback threshold for a type (if any)."""
+        return self._fallback.get(threshold_type)
+
+    def get(
+        self, threshold_type: str, *identity_keys: str | None
+    ) -> float | None:
+        """Look up threshold. Tries candidate keys in order (e.g. person_id UUID,
+        identity_key, person_name). Falls back to (threshold_type, None).
+        """
+        for k in identity_keys:
+            if k is not None:
+                exact = self._table.get((threshold_type, str(k)))
+                if exact is not None:
+                    return exact
+        return self._table.get((threshold_type, None))
+
+
+class OpenSetRecognizer:
+    """Combines gallery search + threshold lookup into an open-set decision.
+
+    Supports the three threshold modes mandated by the spec:
+      - fixed
+      - global_evt
+      - identity_gpd
+    """
+
+    def __init__(
+        self,
+        gallery: GalleryManager,
+        threshold_table: ThresholdTable,
+        gallery_config: GalleryConfig,
+        mode: str = "identity_gpd",
+        fixed_threshold: float = 0.55,
+        min_threshold: float = 0.15,
+    ):
+        self.gallery = gallery
+        self.threshold_table = threshold_table
+        self.gallery_config = gallery_config
+        self.mode = mode
+        self.fixed_threshold = fixed_threshold
+        self.min_threshold = min_threshold
+
+    def decide(
+        self,
+        query: np.ndarray,
+        top_k: int = 5,
+    ) -> OpenSetDecision:
+        """Run gallery search + threshold decision for a query embedding.
+
+        In ``identity_gpd`` mode the top-k candidates are each compared
+        against their own identity-specific threshold (the closest match
+        that passes its own threshold wins). This avoids a look-alike with a
+        looser threshold from "stealing" a known identity that would pass its
+        own tighter threshold but ranks second in raw similarity.
+        """
+        results = self.gallery.search(query, top_k=top_k)
+        if not results:
+            return OpenSetDecision(
+                is_known=False,
+                person_id=None,
+                person_name=None,
+                similarity=0.0,
+                threshold=self.fixed_threshold,
+                threshold_type="fixed",
+                fallback_used=True,
+            )
+
+        candidate = results[0]
+
+        if self.mode in ("fixed", "global_evt"):
+            if self.mode == "fixed":
+                threshold = self.fixed_threshold
+                threshold_type = "fixed"
+                fallback = False
+            else:
+                threshold_type = "global_evt"
+                threshold = self.threshold_table.get(
+                    threshold_type,
+                    candidate.person_id,
+                    candidate.identity_key,
+                    candidate.person_name,
+                )
+                fallback = threshold is None
+                if fallback:
+                    threshold = (
+                        self.threshold_table.fallback(threshold_type)
+                        or self.fixed_threshold
+                    )
+                threshold = max(threshold, self.min_threshold)
+            is_known = candidate.similarity >= threshold
+            return OpenSetDecision(
+                is_known=is_known,
+                person_id=candidate.person_id if is_known else None,
+                person_name=candidate.person_name if is_known else None,
+                similarity=candidate.similarity,
+                threshold=threshold,
+                threshold_type=threshold_type if not fallback else "fixed",
+                fallback_used=fallback,
+                candidate=candidate,
+            )
+
+        # identity_gpd — per-identity threshold over top-k candidates.
+        threshold_type = "identity_gpd"
+        best: GalleryResult | None = None
+        best_sim = -1.0
+        used_threshold: float | None = None
+        best_fallback = False
+
+        for cand in results:
+            thr = self.threshold_table.get(
+                threshold_type,
+                cand.person_id,
+                cand.identity_key,
+                cand.person_name,
+            )
+            cand_fallback = thr is None
+            if thr is None:
+                fb = self.threshold_table.fallback(threshold_type)
+                thr = (
+                    fb
+                    if (fb is not None and fb >= self.min_threshold)
+                    else self.fixed_threshold
+                )
+            thr = max(thr, self.min_threshold)
+            if cand.similarity >= thr and cand.similarity > best_sim:
+                best = cand
+                best_sim = cand.similarity
+                used_threshold = thr
+                best_fallback = cand_fallback
+
+        if best is not None:
+            return OpenSetDecision(
+                is_known=True,
+                person_id=best.person_id,
+                person_name=best.person_name,
+                similarity=best.similarity,
+                threshold=used_threshold or self.fixed_threshold,
+                threshold_type=threshold_type,
+                fallback_used=best_fallback,
+                candidate=best,
+            )
+
+        # No candidate passed its own threshold → UNKNOWN, report top-1 info.
+        thr = self.threshold_table.get(
+            threshold_type,
+            candidate.person_id,
+            candidate.identity_key,
+            candidate.person_name,
+        )
+        fallback = thr is None
+        if fallback:
+            fb = self.threshold_table.fallback(threshold_type)
+            thr = (
+                fb
+                if (fb is not None and fb >= self.min_threshold)
+                else self.fixed_threshold
+            )
+        thr = max(thr, self.min_threshold)
+        return OpenSetDecision(
+            is_known=False,
+            person_id=None,
+            person_name=None,
+            similarity=candidate.similarity,
+            threshold=thr,
+            threshold_type=threshold_type if not fallback else "fixed",
+            fallback_used=fallback,
+            candidate=candidate,
+        )

@@ -1,0 +1,122 @@
+"""Live inference telemetry broadcaster (Web UI camera view).
+
+Pushes annotated frames + detection boxes from the DeepStream engine to the
+dashboard backend (FastAPI /api/internal/inference) over HTTP in a daemon
+thread. The GStreamer probe path only enqueues a small dict (latest-wins),
+so pipeline latency is never blocked on the network.
+
+The payload shape mirrors the frontend ``WebSocketInferencePayload``:
+``{type, timestamp, camera_id, fps, detections, frame_base64, stats}``.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import queue
+import threading
+import time
+import urllib.error
+import urllib.request
+from typing import Any
+
+import numpy as np
+
+logger = logging.getLogger("face-ai.streaming.telemetry")
+
+
+class InferenceBroadcaster:
+    """Daemon-thread HTTP pusher with a latest-wins frame queue."""
+
+    def __init__(self, endpoint: str, timeout_s: float = 1.5):
+        self.endpoint = endpoint
+        self.timeout_s = timeout_s
+        self._queue: "queue.Queue[dict | None]" = queue.Queue(maxsize=2)
+        self._thread: threading.Thread | None = None
+        self._stopped = threading.Event()
+        self._last_error_ts = 0.0
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stopped.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="face-telemetry", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        try:
+            self._queue.put_nowait(None)  # wake the worker
+        except queue.Full:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=self.timeout_s + 1.0)
+            self._thread = None
+
+    def push(self, payload: dict) -> None:
+        """Drop stale frames; keep only the newest pending item."""
+        try:
+            self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._queue.put_nowait(payload)
+        except queue.Full:
+            pass
+
+    def _run(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                payload = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if payload is None:
+                break
+            self._post(payload)
+        # drain nothing; exit
+
+    def _post(self, payload: dict) -> None:
+        try:
+            req = urllib.request.Request(
+                self.endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"HTTP {resp.status}")
+        except (urllib.error.URLError, OSError, RuntimeError) as exc:
+            now = time.monotonic()
+            if now - self._last_error_ts > 5.0:
+                logger.warning(
+                    "telemetry push failed (backend down?): %s", exc
+                )
+                self._last_error_ts = now
+
+
+def encode_frame_jpeg(
+    rgba: np.ndarray, max_width: int = 640, quality: int = 55
+) -> tuple[str, int, int]:
+    """Encode an RGBA frame (H,W,4) to a JPEG base64 string (RGB->BGR).
+
+    Returns ``(b64, out_w, out_h)`` where (out_w, out_h) are the actual JPEG
+    pixel dimensions. Bounding boxes must be scaled to that space so they
+    line up with what the browser actually displays.
+    """
+    import cv2
+
+    h, w = rgba.shape[:2]
+    scale = max_width / float(w) if w > max_width else 1.0
+    if scale < 1.0:
+        rgba = cv2.resize(
+            rgba, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA
+        )
+    out_h, out_w = rgba.shape[:2]
+    bgr = rgba[..., :3][..., ::-1].copy()
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise RuntimeError("JPEG encode failed")
+    return base64.b64encode(buf).decode("ascii"), out_w, out_h

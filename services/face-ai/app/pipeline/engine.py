@@ -1,0 +1,893 @@
+"""DeepStream pipeline engine (integration hub, Phase 0-5).
+
+Full runtime assembly (run on the Jetson):
+
+    rtspsrc (TCP, H265) -> rtph265depay -> h265parse -> nvv4l2decoder
+        -> nvstreammux (resize to detector input)
+        -> nvinfer primary GIE (SCRFD det_10g, output-tensor-meta)
+        -> nvvidconv -> capsfilter(BGRx)        <-[PAD PROBE: SCRFD parse]
+        -> nvdsosd -> nvvidconv -> fakesink
+
+The pad probe implements the open-set recognition cadence:
+SCRFD tensor decode -> tracker (IoU) -> quality gate -> embed (ONNX)
+-> gallery search -> threshold decision -> event persistence.
+
+GStreamer/pyds are imported lazily so the module still imports on a
+Windows dev box (pytest / --import-flag).
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+
+from ..config.settings import Settings
+from ..detection.scrfd import SCRFDParser, ScrfConfig
+from ..events.generator import EventRecord
+from ..openset.decision import OpenSetDecision
+from ..tracking.tracker import TrackState
+
+logger = logging.getLogger("face-ai.pipeline.engine")
+
+# gstreamer protocol bitmask for TCP
+_PROTO_TCP = 0x4
+
+# Web dashboard telemetry endpoint (backend FastAPI /api/internal/inference)
+_TELEMETRY_URL = "http://127.0.0.1:8000/api/internal/inference"
+_TELEMETRY_INTERVAL_S = 0.25  # ~4 pushes / second
+
+
+class PipelineEngine:
+    """Runs the DeepStream face recognition pipeline.
+
+    ``build()`` wires all non-GStreamer components (gallery, thresholds,
+    recognizer, embedder, quality, tracker, SCRFD parser, event generator).
+    ``run()`` assembles the GStreamer pipeline and iterates with retry.
+    """
+
+    RTSP_ERRORS = (
+        "not-linked",
+        "not-negotiated",
+        "streaming stopped",
+        "timeout",
+        "connect",
+        "rtsp",
+        "resource",
+        "noformat",
+        "internal data stream error",
+        "received end-of-file",
+    )
+
+    def __init__(
+        self,
+        settings: Settings,
+        restart_delay_s: int = 5,
+        max_restarts: int = 20,
+    ):
+        self.settings = settings
+        self.restart_delay_s = restart_delay_s
+        self.max_restarts = max_restarts
+
+        self._running = False
+        self._pipeline = None
+        self._loop = None
+        self._Gst = None
+        self._GLib = None
+        self._frame_idx = 0
+        self._telemetry = None
+        self._last_push_t = 0.0
+        self._push_frames = 0
+        self._fps_ema = 0.0
+
+    # ------------------------------------------------------------------
+    # 1) Non-GStreamer wiring (runs on any host)
+    # ------------------------------------------------------------------
+    def build(self) -> None:
+        """Load gallery, thresholds and instantiate inference components."""
+        from .camera import Camera
+        from ..detection.detector import FaceDetector
+        from ..tracking.tracker import FaceTracker
+        from ..recognition.embedder import FaceEmbedder
+        from ..recognition.quality import FaceQualityEvaluator
+        from ..gallery.manager import GalleryManager
+        from ..openset.decision import OpenSetRecognizer, ThresholdTable
+        from ..events.generator import EventGenerator
+
+        size = self.settings.detector.input_size or [640, 640]
+        self._input_w, self._input_h = int(size[0]), int(size[1])
+        self.parser = SCRFDParser(
+            ScrfConfig(
+                input_w=self._input_w,
+                input_h=self._input_h,
+                score_threshold=self.settings.detector.score_threshold,
+                nms_threshold=self.settings.detector.nms_threshold,
+            )
+        )
+
+        self.camera = Camera(self.settings.camera)
+        self.detector = FaceDetector(class_id=0)
+        self.tracker = FaceTracker()
+        self.embedder = FaceEmbedder(self.settings.recognition)
+        self.quality = FaceQualityEvaluator(self.settings.quality)
+        self.event_gen = EventGenerator(self.settings.postgresql)
+        self._components = [
+            self.camera,
+            self.detector,
+            self.tracker,
+            self.embedder,
+            self.quality,
+            self.event_gen,
+        ]
+
+        # Gallery load-on-startup (Rule 4: in-memory, no per-frame DB)
+        gallery = GalleryManager(
+            self.settings.postgresql, self.settings.gallery
+        )
+        if self.settings.gallery.load_on_startup:
+            gallery.load()
+
+        thresholds = ThresholdTable()
+        # Prefer the offline-produced JSON table (Rule 7). Falls back to DB.
+        if self.settings.thresholds_path.exists():
+            thresholds.load_from_json(self.settings.thresholds_path)
+        else:
+            thresholds.load_from_db(
+                self.settings.postgresql, self.settings.gallery.model_version
+            )
+
+        self.recognizer = OpenSetRecognizer(
+            gallery=gallery,
+            threshold_table=thresholds,
+            gallery_config=self.settings.gallery,
+            mode="identity_gpd",
+        )
+        self.gallery = gallery
+
+        # Web dashboard telemetry (best-effort; backend may be offline)
+        from ..streaming.telemetry import InferenceBroadcaster, encode_frame_jpeg
+
+        self._encode_frame_jpeg = encode_frame_jpeg
+        self._telemetry = InferenceBroadcaster(_TELEMETRY_URL)
+        self._telemetry.start()
+
+    # ------------------------------------------------------------------
+    # 2) GStreamer assembly (Jetson only)
+    # ------------------------------------------------------------------
+    def _gst(self):
+        """Lazily init and cache GStreamer (idempotent)."""
+        if self._Gst is not None:
+            return self._Gst, self._GLib
+        import gi
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst, GLib
+
+        Gst.init(None)
+        self._Gst, self._GLib = Gst, GLib
+        return Gst, GLib
+
+    def _make(self, Gst, kind, name):
+        elem = Gst.ElementFactory.make(kind, name)
+        if not elem:
+            raise RuntimeError(f"GStreamer element not found: {kind}")
+        return elem
+
+    def _attach_rtsp_src(self, Gst, pipeline, src_bin_el, decoder, streammux):
+        """Wire uridecodebin raw video pad -> converter -> streammux.
+
+        uridecodebin internally instantiates rtspsrc + depay + parse and
+        exposes RAW video/x-raw pads; we only need to avoid the audio pad.
+        rtspsrc settings (TCP, latency) are applied via the source-setup
+        signal, matching the proven layout of the legacy run_inference.py.
+        """
+        conv = self._make(Gst, "nvvideoconvert", "rtsp-conv")
+        caps = self._make(Gst, "capsfilter", "rtsp-caps")
+        caps.set_property(
+            "caps",
+            Gst.Caps.from_string("video/x-raw(memory:NVMM),format=NV12"),
+        )
+        q = self._make(Gst, "queue", "rtsp-ds-queue")
+        q.set_property("max-size-buffers", 16)
+        q.set_property("max-size-time", 0)
+        q.set_property("max-size-bytes", 0)
+        q.set_property("leaky", 0)  # no-drain: let decoder pace at realtime
+        for e in (conv, caps, q):
+            pipeline.add(e)
+        if not (conv.link(caps) and caps.link(q)):
+            raise RuntimeError("RTSP convert chain link failed")
+        if q.get_static_pad("src").link(
+            streammux.get_request_pad("sink_0")
+        ) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("RTSP queue -> streammux link failed")
+
+        camera = self.settings.camera
+
+        def on_source_setup(element, source, cam=camera):
+            cname = source.__class__.__name__.lower()
+            if "rtspsrc" in cname:
+                source.set_property(
+                    "protocols", _PROTO_TCP if cam.protocol == "tcp" else 4
+                )
+                source.set_property("latency", cam.latency_ms)
+                source.set_property("drop-on-latency", True)
+                logger.info("rtspsrc: TCP, latency=%dms", cam.latency_ms)
+
+        src_bin_el.connect("source-setup", on_source_setup)
+
+        def on_pad_added(element, pad, cv=conv, cf=caps, qq=q):
+            pad_caps = pad.get_current_caps()
+            caps_str = pad_caps.to_string() if pad_caps else ""
+            if "video" not in caps_str:
+                return
+            for e in (cv, cf, qq):
+                e.sync_state_with_parent()
+            if pad.link(cv.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+                logger.warning("uridecodebin pad link failed: %s", caps_str[:80])
+                return
+            logger.info("RTSP video pad linked: %s", caps_str[:80])
+
+        src_bin_el.connect("pad-added", on_pad_added)
+
+    def _setup_source(self, Gst, pipeline, streammux):
+        """Add the camera source chain feeding streammux."""
+        camera = self.settings.camera
+
+        if camera.source_type == "csi":
+            src = self._make(Gst, "nvarguscamerasrc", "csi-src")
+            src.set_property("sensor-id", camera.sensor_id)
+            for name, value in (camera.csi_tuning or {}).items():
+                try:
+                    src.set_property(name, value)
+                    logger.info("CSI prop %s=%s", name, value)
+                except Exception:
+                    logger.exception("CSI prop %s=%s rejected", name, value)
+            conv = self._make(Gst, "nvvideoconvert", "csi-conv")
+            caps = self._make(Gst, "capsfilter", "csi-caps")
+            caps.set_property(
+                "caps",
+                Gst.Caps.from_string(
+                    "video/x-raw(memory:NVMM),format=NV12,"
+                    f"width={camera.width},height={camera.height},"
+                    f"framerate={camera.fps}/1"
+                ),
+            )
+            for e in (src, conv, caps):
+                pipeline.add(e)
+            if not (src.link(conv) and conv.link(caps)):
+                raise RuntimeError("CSI source link failed")
+            sink = streammux.get_request_pad("sink_0")
+            ok = caps.get_static_pad("src").link(sink)
+            if ok != Gst.PadLinkReturn.OK:
+                raise RuntimeError("CSI -> streammux link failed")
+            return
+
+        # RTSP
+        src = self._make(Gst, "uridecodebin", "rtsp-src")
+        src.set_property("uri", camera.uri)
+        pipeline.add(src)
+        self._attach_rtsp_src(Gst, pipeline, src, None, streammux)
+
+    def _build_pipeline(self, Gst):
+        pipeline = Gst.Pipeline.new("face-ai-pipeline")
+
+        streammux = self._make(Gst, "nvstreammux", "stream-mux")
+        streammux.set_property("batch-size", 1)
+        streammux.set_property("width", self.settings.camera.width)
+        streammux.set_property("height", self.settings.camera.height)
+        streammux.set_property("batched-push-timeout", 40000)
+        streammux.set_property("attach-sys-ts", False)
+        streammux.set_property("sync-inputs", False)
+        pipeline.add(streammux)
+
+        self._setup_source(Gst, pipeline, streammux)
+
+        infer = self._make(Gst, "nvinfer", "primary-gie")
+        infer.set_property(
+            "config-file-path", str(Path(self.settings.deepstream.primary_gie_config).resolve())
+        )
+        pipeline.add(infer)
+
+        conv1 = self._make(Gst, "nvvideoconvert", "post-conv1")
+        caps = self._make(Gst, "capsfilter", "post-rgba")
+        caps.set_property(
+            "caps",
+            Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"),
+        )
+        osd = self._make(Gst, "nvdsosd", "osd")
+        osd.set_property("process-mode", 0)
+        osd.set_property("display-text", True)
+        conv2 = self._make(Gst, "nvvideoconvert", "post-conv2")
+        sink = self._make(Gst, "fakesink", "output-sink")
+        for e in (conv1, caps, osd, conv2, sink):
+            pipeline.add(e)
+
+        ok = (streammux.link(infer)
+              and infer.link(conv1)
+              and conv1.link(caps)
+              and caps.link(osd)
+              and osd.link(conv2)
+              and conv2.link(sink))
+        if not ok:
+            raise RuntimeError("static pipeline link failed")
+
+        # recognition probe on the RGBA caps src (frame crop available here)
+        probe_pad = caps.get_static_pad("src")
+        probe_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_probe, None)
+
+        return pipeline
+
+    # ------------------------------------------------------------------
+    # 3) Pad probe: recognition cadence
+    # ------------------------------------------------------------------
+    def _on_probe(self, pad, info, u_data):
+        Gst, _ = self._gst()
+        import pyds
+
+        gst_buffer = info.get_buffer()
+        if gst_buffer is None:
+            return Gst.PadProbeReturn.OK
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        frame_meta_list = batch_meta.frame_meta_list
+
+        while frame_meta_list is not None:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(frame_meta_list.data)
+            except StopIteration:
+                break
+
+            self._frame_idx += 1
+            tensors = self._collect_tensors(frame_meta.frame_user_meta_list)
+            try:
+                if tensors:
+                    try:
+                        dets = self.parser.parse(tensors)
+                    except Exception:
+                        logger.exception("SCRFD parse failed")
+                        dets = []
+                    self._process_frame(dets, gst_buffer, frame_meta)
+                else:
+                    if self._frame_idx % 30 == 0:
+                        logger.warning(
+                            "no tensors for frame %s (collect returned empty)",
+                            self._frame_idx,
+                        )
+                    self._process_frame([], gst_buffer, frame_meta)
+            except Exception:
+                logger.exception(
+                    "unhandled error in _process_frame at frame %s",
+                    self._frame_idx,
+                )
+
+            try:
+                frame_meta_list = frame_meta_list.next
+            except StopIteration:
+                break
+
+        return Gst.PadProbeReturn.OK
+
+    def _expected_layer_sizes(self) -> list[int]:
+        """Float counts for the 9 canonical SCRFD outputs, in layer order:
+        score_8, score_16, score_32, bbox_8, bbox_16, bbox_32,
+        kps_8, kps_16, kps_32."""
+        cfg = self.parser.config
+        sizes: list[int] = []
+        for mult in (1, 4, 10):
+            for s in cfg.strides:
+                n = (cfg.input_h // s) * (cfg.input_w // s)
+                sizes.append(n * cfg.num_anchors * mult)
+        return sizes
+
+    def _collect_tensors(self, user_meta_list) -> dict[str, np.ndarray]:
+        """Extract the 9 SCRFD tensors from the primary GIE tensor meta.
+
+        On this stack the deserialized TRT engine renames outputs to numeric
+        ids ('448', '451', ...) and the tensor-meta ``dims`` only carries the
+        last output dim ([1]/[4]/[10]), so names/dims are NOT reliable.
+        The output ORDER is canonical SCRFD (score x3, bbox x3, kps x3,
+        strides 8/16/32), so sizes are taken from the detector config and the
+        returned dict keys are regenerated as "score_8" / "bbox_16" etc.
+        """
+        import ctypes as ct
+        import pyds
+
+        cfg = self.parser.config
+        sizes = self._expected_layer_sizes()
+        kinds = ("score", "bbox", "kps")
+        tensors: dict[str, np.ndarray] = {}
+        l_user = user_meta_list
+        while l_user is not None:
+            try:
+                user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+            except StopIteration:
+                break
+            if user_meta.base_meta.meta_type == pyds.NVDSINFER_TENSOR_OUTPUT_META:
+                tm = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
+                if int(tm.unique_id) != 1:
+                    try:
+                        l_user = l_user.next
+                    except StopIteration:
+                        break
+                    continue
+                n_layers = int(tm.num_output_layers)
+                for i in range(min(n_layers, len(sizes))):
+                    layer = pyds.get_nvds_LayerInfo(tm, i)
+                    if not layer or not layer.buffer:
+                        continue
+                    size = sizes[i]
+                    if size <= 0:
+                        continue
+                    try:
+                        ptr = pyds.get_ptr(layer.buffer)
+                        arr = np.ctypeslib.as_array(
+                            ct.cast(ct.c_void_p(ptr), ct.POINTER(ct.c_float)),
+                            shape=(size,),
+                        ).copy()
+                    except Exception:
+                        continue
+                    kind = kinds[i // 3] if i < 9 else f"layer_{i}"
+                    stride = cfg.strides[i % 3]
+                    tensors[f"{kind}_{stride}"] = arr
+            try:
+                l_user = l_user.next
+            except StopIteration:
+                break
+        return tensors
+
+    def _process_frame(self, dets, gst_buffer, frame_meta) -> None:
+        frame_rgba = self._get_frame_rgba(gst_buffer, frame_meta)
+        if frame_rgba is None:
+            if self._frame_idx % 30 == 0:
+                logger.warning(
+                    "frame %s: _get_frame_rgba returned None (surface read failed)",
+                    self._frame_idx,
+                )
+            return
+
+        # Scale bboxes from model input space (640x640) to frame display space
+        from ..detection.detector import Detection
+        frame_w = frame_rgba.shape[1]
+        frame_h = frame_rgba.shape[0]
+        sx = frame_w / self._input_w
+        sy = frame_h / self._input_h
+        if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
+            scaled = []
+            for det in dets:
+                x, y, w, h = det.bbox
+                scaled_lm = None
+                if getattr(det, "landmarks", None) is not None:
+                    scaled_lm = det.landmarks.copy()
+                    scaled_lm[:, 0] *= sx
+                    scaled_lm[:, 1] *= sy
+                scaled.append(Detection(
+                    bbox=(x * sx, y * sy, w * sx, h * sy),
+                    confidence=det.confidence,
+                    class_id=det.class_id,
+                    frame_id=getattr(det, "frame_id", 0),
+                    landmarks=scaled_lm,
+                ))
+            dets = scaled
+
+        bboxes = [d.bbox for d in dets]
+        pairs = self.tracker.associate(bboxes)
+        n_skip_quality = 0
+        n_skip_state = 0
+        n_skip_embed = 0
+        n_recognized = 0
+        q_sample = None
+        bbox_sample = None
+
+        # Recognition cadence: only run embed+decide every N frames.
+        # Tracker association still runs every frame for bbox continuity.
+        embed_interval = self.settings.recognition.recognition_interval_frames
+        embed_frame = (embed_interval <= 1) or (self._frame_idx % embed_interval == 0)
+
+        if embed_frame:
+            for det, (track, _bbox) in zip(dets, pairs):
+                if track.recognized and track.state is TrackState.KNOWN:
+                    continue
+
+                crop = self._crop_bgr(frame_rgba, det.bbox)
+                q = self.quality.evaluate(crop, det.confidence)
+                if q.is_low_quality:
+                    n_skip_quality += 1
+                    if q_sample is None:
+                        q_sample = (
+                            f"blur={q.blur:.1f} bright={q.brightness:.1f} "
+                            f"size={q.face_size} conf={det.confidence:.3f}"
+                        )
+                        bbox_sample = tuple(round(float(v), 1) for v in det.bbox)
+                    continue
+                if track.state not in (TrackState.OBSERVING, TrackState.UNKNOWN):
+                    n_skip_state += 1
+                    continue
+
+                if track.state is TrackState.UNKNOWN and not track.re_eval:
+                    track.votes = []
+                    track.re_eval = True
+
+                prev_state = track.state
+                prev_pid = getattr(track, "person_id", None)
+
+                # Face alignment with 5 keypoints (InsightFace ArcFace standard)
+                face_input = None
+                if getattr(det, "landmarks", None) is not None:
+                    bgr_full = frame_rgba[:, :, :3][..., ::-1]
+                    face_input = self.embedder.align_face(bgr_full, det.landmarks)
+                if face_input is None:
+                    face_input = crop
+
+                result = self.embedder.extract(face_input)
+                if result is None:
+                    n_skip_embed += 1
+                    continue
+                decision = self.recognizer.decide(result.embedding)
+
+                # Temporal voting: only lock a decision after the same identity
+                # (or UNKNOWN) wins 2 of the last 3 observations. Prevents a single
+                # noisy 720p crop from mislabelling a person (Nam -> Phuc/Binh).
+                track.votes.append((decision.person_id, decision.person_name,
+                                    decision.similarity, decision.threshold))
+                track.votes = track.votes[-3:]
+                if not self._resolve_track_decision(track):
+                    continue
+
+                track.best_embedding = result.embedding
+                track.best_similarity = track.decision.similarity
+                track.state = TrackState.KNOWN if track.decision.is_known else TrackState.UNKNOWN
+                track.recognized = True
+                track.re_eval = track.state is TrackState.UNKNOWN
+                track.person_id = track.decision.person_id
+                track.person_name = track.decision.person_name
+                track.threshold = track.decision.threshold
+                track.threshold_type = track.decision.threshold_type
+                track.fallback_used = track.decision.fallback_used
+                n_recognized += 1
+
+                if not (
+                    prev_state is TrackState.UNKNOWN
+                    and track.state is TrackState.UNKNOWN
+                    and track.person_id == prev_pid
+                ):
+                    self._emit(gst_buffer, frame_meta, track, track.decision)
+
+        self.tracker.expire()
+        if self._frame_idx % 30 == 0:
+            logger.warning(
+                "recog diag frame=%s dets=%d skip_q=%d skip_state=%d "
+                "skip_embed=%d recognized=%d active_tracks=%d q_sample=%s bbox=%s",
+                self._frame_idx,
+                len(dets),
+                n_skip_quality,
+                n_skip_state,
+                n_skip_embed,
+                n_recognized,
+                len(self.tracker.tracks),
+                q_sample,
+                bbox_sample,
+            )
+        self._push_telemetry(frame_rgba, pairs)
+
+    def _resolve_track_decision(self, track) -> bool:
+        """Apply temporal majority voting over the track's recent decisions.
+
+        Returns True (and sets ``track.decision``) once the same identity
+        (or UNKNOWN) wins 2 of the last 3 observations. Until then the track
+        stays unresolved and is re-evaluated on later frames.
+        """
+        from collections import Counter
+
+        from ..openset.decision import OpenSetDecision
+
+        votes = track.votes
+        if len(votes) < 2:
+            return False
+        counter: Counter = Counter(pid for pid, _name, _sim, _thr in votes)
+        winner_pid, count = counter.most_common(1)[0]
+        if count < 2:
+            return False
+        # Pick the strongest vote among the winning identity
+        best = max(
+            ((s, t, _n) for pid, _n, s, t in votes if pid == winner_pid),
+            key=lambda v: v[0],
+        )
+        sim, thr, name = best
+        track.decision = OpenSetDecision(
+            is_known=winner_pid is not None,
+            person_id=winner_pid,
+            person_name=name,
+            similarity=float(sim),
+            threshold=float(thr),
+            threshold_type="identity_gpd",
+            fallback_used=False,
+            candidate=None,
+        )
+        return True
+
+    def _push_telemetry(self, frame_rgba, pairs) -> None:
+        tele = self._telemetry
+        if tele is None:
+            return
+        now = time.monotonic()
+        self._push_frames += 1
+        if now - self._last_push_t < _TELEMETRY_INTERVAL_S:
+            return
+
+        dt = now - self._last_push_t
+        if dt > 0:
+            inst = self._push_frames / dt
+            self._fps_ema = 0.8 * self._fps_ema + 0.2 * inst
+        self._last_push_t = now
+        self._push_frames = 0
+
+        if self._frame_idx % 300 == 0:
+            logger.warning(
+                "telemetry tick frame=%s dets=%d fps=%.1f",
+                self._frame_idx,
+                len(pairs),
+                self._fps_ema,
+            )
+
+        detections = []
+        for track, bbox in pairs:
+            det = {
+                "track_id": track.track_id,
+                "bbox": {
+                    "x1": float(bbox[0]),
+                    "y1": float(bbox[1]),
+                    "x2": float(bbox[0] + bbox[2]),
+                    "y2": float(bbox[1] + bbox[3]),
+                },
+                "status": "UNKNOWN",
+                "label": "Unknown",
+                "similarity": None,
+                "threshold": None,
+                "threshold_type": getattr(track, "threshold_type", "identity_gpd"),
+                "fallback_used": bool(getattr(track, "fallback_used", False)),
+            }
+            if track.recognized:
+                if track.state is TrackState.KNOWN:
+                    det["status"] = "KNOWN"
+                    det["label"] = track.person_name or "KNOWN"
+                    det["person_id"] = track.person_id
+                else:
+                    det["status"] = "UNKNOWN"
+                    det["label"] = "UNKNOWN"
+                det["similarity"] = round(float(track.best_similarity), 4)
+                det["threshold"] = round(float(getattr(track, "threshold", 0.0)), 4)
+            detections.append(det)
+
+        try:
+            frame_b64, out_w, out_h = self._encode_frame_jpeg(frame_rgba)
+        except Exception:
+            logger.exception("telemetry frame encode failed")
+            frame_b64 = None
+            out_w = frame_rgba.shape[1]
+            out_h = frame_rgba.shape[0]
+
+        # Frontend displays the downscaled JPEG (out_w x out_h), so map the
+        # display-space boxes (1920x1080) into the JPEG pixel space.
+        tx = out_w / frame_rgba.shape[1]
+        ty = out_h / frame_rgba.shape[0]
+        for det in detections:
+            b = det["bbox"]
+            det["bbox"] = {
+                "x1": b["x1"] * tx,
+                "y1": b["y1"] * ty,
+                "x2": b["x2"] * tx,
+                "y2": b["y2"] * ty,
+            }
+
+        self._debug_capture(frame_rgba, pairs)
+
+        tele.push(
+            {
+                "type": "inference_update",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "camera_id": self.settings.camera.id,
+                "fps": round(self._fps_ema, 1),
+                "detections": detections,
+                "frame_base64": frame_b64,
+            }
+        )
+
+    def _debug_capture(self, frame_rgba, pairs) -> None:
+        """One-off bbox overlay capture: saves a JPEG with the displayed bbox
+        drawn over the raw frame so offsets can be verified visually.
+
+        Guarded by marker file ``debug/.cap_marker`` (created/deleted from
+        the shell) inside the repo; removes the marker after the first hit so
+        it runs exactly once. Debug outputs stay inside the repo (debug/).
+        """
+        debug_dir = Path("debug")
+        marker = debug_dir / ".cap_marker"
+        if not marker.exists():
+            return
+        if len(pairs) == 0:
+            return  # keep waiting until faces are detected
+        try:
+            import cv2
+            import cv2 as _cv2
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            img = frame_rgba[:, :, :3].copy()  # BGRx -> BGR
+            for track, bbox in pairs:
+                x1, y1, w, h = (int(v) for v in bbox)
+                x2, y2 = x1 + w, y1 + h
+                color = (0, 255, 0) if track.recognized else (0, 200, 255)
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
+                cv2.putText(
+                    img,
+                    f"t{track.track_id}",
+                    (x1, max(0, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    color,
+                    2,
+                )
+            out = debug_dir / "face_dbg_boxed.jpg"
+            cv2.imwrite(str(out), img)
+            out_raw = debug_dir / "face_dbg_raw.jpg"
+            cv2.imwrite(str(out_raw), frame_rgba[:, :, :3])
+            marker.unlink(missing_ok=True)
+            logger.warning(
+                "debug capture saved: %s (%s boxes) coords=%s",
+                out,
+                len(pairs),
+                [[round(v, 1) for v in b] for _t, b in pairs],
+            )
+        except Exception:
+            logger.exception("debug capture failed")
+
+    def _emit(self, gst_buffer, frame_meta, track, decision: OpenSetDecision) -> None:
+        record = EventRecord(
+            camera_id=self.settings.camera.id,
+            track_id=track.track_id,
+            decision=decision,
+            quality_score=None,
+            snapshot_path=None,
+            occurred_at=datetime.now(timezone.utc).isoformat(),
+        )
+        try:
+            self.event_gen.persist(record)
+        except Exception:
+            logger.exception("Event persist failed")
+
+        if decision.is_known:
+            logger.info(
+                "KNOWN   track=%d person=%s (%.3f >= %.3f)",
+                track.track_id,
+                decision.person_name,
+                decision.similarity,
+                decision.threshold,
+            )
+        else:
+            logger.info(
+                "UNKNOWN track=%d sim=%.3f < thr=%.3f",
+                track.track_id,
+                decision.similarity,
+                decision.threshold,
+            )
+
+    def _get_frame_rgba(self, gst_buffer, frame_meta) -> np.ndarray | None:
+        import pyds
+
+        try:
+            surface = pyds.get_nvds_buf_surface(
+                hash(gst_buffer), int(frame_meta.batch_id)
+            )
+            return np.asarray(surface)
+        except Exception:
+            logger.exception("get_nvds_buf_surface failed")
+            return None
+
+    @staticmethod
+    def _crop_bgr(rgba: np.ndarray, bbox) -> np.ndarray:
+        x1 = max(0, int(bbox[0]))
+        y1 = max(0, int(bbox[1]))
+        x2 = min(rgba.shape[1], int(bbox[0] + bbox[2]))
+        y2 = min(rgba.shape[0], int(bbox[1] + bbox[3]))
+        if x2 <= x1 or y2 <= y1:
+            return np.empty((0, 0, 3), dtype=np.uint8)
+        bgr = rgba[y1:y2, x1:x2, :3][..., ::-1]
+        return np.ascontiguousarray(bgr)
+
+    # ------------------------------------------------------------------
+    # 4) Run loop with retry
+    # ------------------------------------------------------------------
+    def run(self) -> int:
+        camera = self.settings.camera
+        self.build()
+        logger.info(
+            "Gallery: %d vectors / %d persons", self.gallery.n_vectors, self.gallery.n_persons
+        )
+        logger.info("Camera[%s] %s -> %s", camera.id, camera.source_type, camera.uri or "CSI")
+
+        Gst, GLib = self._gst()
+        self._running = True
+        attempts = 0
+
+        while self._running:
+            attempts += 1
+            if attempts > self.max_restarts:
+                logger.error("Too many restarts (%d). Giving up.", self.max_restarts)
+                break
+            try:
+                self._run_once(Gst, GLib)
+            except KeyboardInterrupt:
+                self._running = False
+            except Exception:
+                logger.exception("Pipeline iteration %d failed", attempts)
+                if not self._running:
+                    break
+            finally:
+                self._teardown()
+
+            if self._running and self.restart_delay_s > 0:
+                logger.info("Restarting in %ds...", self.restart_delay_s)
+                for _ in range(self.restart_delay_s):
+                    if not self._running:
+                        break
+                    time.sleep(1)
+
+        logger.info("Pipeline stopped. Stats: frames=%d", self._frame_idx)
+        return 0
+
+    def _run_once(self, Gst, GLib) -> None:
+        self._pipeline = self._build_pipeline(Gst)
+
+        bus = self._pipeline.get_bus()
+        bus.add_signal_watch()
+        GLib.MainLoop
+        self._loop = GLib.MainLoop()
+        bus.connect("message", self._on_bus_message)
+
+        ret = self._pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("Pipeline failed to reach PLAYING")
+        logger.info("Pipeline PLAYING")
+        self._loop.run()
+
+    def _on_bus_message(self, bus, message):
+        Gst, GLib = self._gst()
+        t = message.type
+
+        if t == Gst.MessageType.EOS:
+            logger.info("EOS — stopping")
+            GLib.idle_add(self._loop.quit)
+
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            src = message.src.get_name() if message.src else "?"
+            combined = (err.message + (debug or "")).lower()
+            if any(k in combined for k in self.RTSP_ERRORS):
+                logger.error("Recoverable error (%s): %s", src, err.message)
+            else:
+                logger.error("Fatal error (%s): %s — %s", src, err.message, str(debug)[:160])
+                self._running = False
+            GLib.idle_add(self._loop.quit)
+
+        elif t == Gst.MessageType.WARNING:
+            warn, debug = message.parse_warning()
+            skip = ("nvbuf-memory-type", "gpu-id", "clock problem", "latency")
+            if not any(s in (str(debug or "")) for s in skip):
+                logger.warning("WARN: %s", warn.message)
+
+    def _teardown(self) -> None:
+        if self._telemetry is not None:
+            try:
+                self._telemetry.stop()
+            except Exception:
+                pass
+            self._telemetry = None
+        if self._pipeline:
+            try:
+                bus = self._pipeline.get_bus()
+                self._pipeline.set_state(0)  # Gst.State.NULL
+                bus.remove_signal_watch()
+            except Exception:
+                pass
+        self._pipeline = None
+        self._loop = None

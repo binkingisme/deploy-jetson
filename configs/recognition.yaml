@@ -1,0 +1,30 @@
+# ============================================================
+# Face recognition configuration (FR-004, FR-011)
+# ============================================================
+
+recognition:
+  backbone: "IR-SE50"
+  model_name: "w600k_r50"
+  model_version: "1.0.0"
+  input_size: [112, 112]
+  embedding_dimension: 512
+  normalization: "l2"
+  model_path: "models/recognition/w600k_r50.onnx"
+  engine_path: "models/recognition/face_recog_fp16.engine"
+  runtime: "tensorrt"                # onnx | tensorrt
+  device: "cuda:0"
+  recognition_interval_frames: 3    # run embed+decide every N frames (1 = every frame)
+
+quality:
+  enabled: true
+  min_face_size: 40
+  min_confidence: 0.5
+  max_blur: 100.0                    # Laplacian variance threshold
+  min_brightness: 30.0
+  max_brightness: 220.0
+
+preprocessing:
+  resize_mode: "original"             # DeepStream delivers original face crop
+  color_format: "bgr"
+  mean: [127.5, 127.5, 127.5]
+  std: 128.0

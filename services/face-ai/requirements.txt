@@ -1,0 +1,18 @@
+# face-ai service Python dependencies
+# Runtime (Phase 0-5)
+numpy>=1.24,<2.0
+opencv-python-headless>=4.8
+onnxruntime-gpu>=1.16
+psycopg2-binary>=2.9
+pydantic>=2.5
+python-dotenv>=1.0
+pyarrow>=14.0
+
+# Dev / test
+pytest>=7.4
+pytest-cov>=4.1
+ruff>=0.3
+mypy>=1.8
+
+# Note: pyyaml is used by config/settings.py loader.
+PyYAML>=6.0

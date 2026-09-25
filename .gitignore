@@ -1,0 +1,51 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE and system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Models & heavy binaries (do not commit — download separately)
+models/
+*.engine
+*.onnx
+*.npz
+*.parquet
+
+# Temporary / debug files
+debug_jetson_face_0.jpg
+*.zip
+*.log
+*.docx
+
+# User captures and face registrations
+static/captures/*
+!static/captures/.gitkeep
+static/face_registrations/*
+!static/face_registrations/.gitkeep
+capture/*
+!capture/.gitkeep

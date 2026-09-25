@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hệ thống Giám sát Camera AI</title>
+    <!-- Thư viện Bootstrap 5 cho giao diện -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- FontAwesome cho các icon đẹp mắt -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- File CSS tùy chỉnh của chúng ta -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="bg-light">
+
+    <!-- Header (Thanh điều hướng trên cùng) -->
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary custom-header shadow-sm">
+        <div class="container-fluid">
+            <a class="navbar-brand fw-bold" href="#">
+                Hệ Thống Giám Sát
+            </a>
+        </div>
+    </nav>
+
+    <!-- Nội dung chính -->
+    <div class="container-fluid mt-3">
+        <div class="row g-3">
+            
+            <!-- CỘT 1: Danh sách Camera (Bên trái) -->
+            <div class="col-lg-2 col-md-3">
+                <div class="card shadow-sm border-0 h-100">
+                    <div class="card-header bg-white border-bottom fw-bold text-primary">
+                        DANH SÁCH CAMERA
+                    </div>
+                    <div class="card-body p-2">
+                        <div class="list-group list-group-flush w-100">
+                            <!-- Nút Camera 1 (Đang chọn) -->
+                            <button type="button" class="list-group-item list-group-item-action active rounded mb-1 d-flex justify-content-between align-items-center" data-camera="camera_1">
+                                <span><i class="fas fa-video me-2"></i>Camera 1</span>
+                                <span class="badge bg-secondary rounded-pill status-badge">Offline</span>
+                            </button>
+                            <!-- Nút Camera 2 -->
+                            <button type="button" class="list-group-item list-group-item-action rounded mb-1 text-muted d-flex justify-content-between align-items-center" data-camera="camera_2">
+                                <span><i class="fas fa-video me-2"></i>Camera 2</span>
+                                <span class="badge bg-secondary rounded-pill status-badge">Offline</span>
+                            </button>
+                            <!-- Nút Camera 3 (Tạm thời gỡ)
+                            <button type="button" class="list-group-item list-group-item-action rounded mb-1 text-muted d-flex justify-content-between align-items-center" data-camera="camera_3">
+                                <span><i class="fas fa-video me-2"></i>Camera 3</span>
+                                <span class="badge bg-secondary rounded-pill status-badge">Offline</span>
+                            </button>
+                            -->
+                            <!-- Nút Camera 4 (Tạm thời gỡ)
+                            <button type="button" class="list-group-item list-group-item-action rounded text-muted d-flex justify-content-between align-items-center" data-camera="camera_4">
+                                <span><i class="fas fa-video me-2"></i>Camera 4</span>
+                                <span class="badge bg-secondary rounded-pill status-badge">Offline</span>
+                            </button>
+                            -->
+                        </div>
+                        
+                        <div class="mt-2 pt-2 border-top w-100">
+                            <button type="button" class="btn btn-outline-primary w-100 py-2.5 fw-bold" id="btn-nav-register" style="border-radius: 6px;">
+                                Đăng ký khuôn mặt
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- PHẦN HIỂN THỊ ĐỘNG (BÊN PHẢI CỘT 1) -->
+            <div class="col-lg-10 col-md-9">
+                <!-- VIEW 1: GIÁM SÁT HỆ THỐNG (Mặc định hiển thị) -->
+                <div class="row g-3" id="view-monitoring">
+                    <!-- Màn hình hiển thị Video -->
+                    <div class="col-lg-8 col-md-12">
+                        <div class="card shadow-sm border-0 video-card">
+                            <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+                                <span>Trực tiếp: Camera 1</span>
+                            </div>
+                            <!-- Khu vực chứa video -->
+                            <div class="card-body p-0 bg-black text-center video-container">
+                                <img src="{{ url_for('video_feed') }}" alt="Camera Feed" class="video-feed">
+                            </div>
+                            <div class="card-footer bg-white text-muted small d-flex justify-content-between">
+                                <span id="val-resolution">Độ phân giải: Đang tải...</span>
+                                <span>Mô hình nhận diện: YOLO</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Bảng Benchmark & Nút Điều khiển -->
+                    <div class="col-lg-4 col-md-12">
+                        <!-- Bảng Benchmark -->
+                        <div class="card shadow-sm border-0 mb-3">
+                            <button class="card-header bg-white border-bottom fw-bold text-primary d-flex justify-content-between align-items-center w-100 text-start border-0 py-3" type="button" data-bs-toggle="collapse" data-bs-target="#benchmarkCollapse" aria-expanded="true" aria-controls="benchmarkCollapse" style="outline: none; box-shadow: none;">
+                                <span><i class="fas fa-chart-bar me-2"></i>BENCHMARK HỆ THỐNG</span>
+                                <i class="fas fa-chevron-down toggle-icon"></i>
+                            </button>
+                            <div id="benchmarkCollapse" class="collapse show">
+                                <div class="card-body pt-0">
+                                    <!-- FPS -->
+                                    <div class="d-flex justify-content-between mb-2 align-items-center">
+                                        <span class="text-muted fw-semibold">Khung hình/giây (FPS)</span>
+                                        <span id="val-fps" class="badge bg-primary fs-6">0</span>
+                                    </div>
+                                    <div class="progress mb-3" style="height: 6px;">
+                                        <div id="progress-fps" class="progress-bar bg-primary progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%"></div>
+                                    </div>
+
+                                    <!-- Độ trễ -->
+                                    <div class="d-flex justify-content-between mb-2 align-items-center">
+                                        <span class="text-muted fw-semibold">Độ trễ mạng (Ping)</span>
+                                        <span id="val-latency" class="badge bg-warning text-dark fs-6">Offline</span>
+                                    </div>
+                                    <div class="progress mb-3" style="height: 6px;">
+                                        <div id="progress-latency" class="progress-bar bg-warning" role="progressbar" style="width: 0%"></div>
+                                    </div>
+
+                                    <!-- Jetson CPU -->
+                                    <div class="d-flex justify-content-between mb-2 align-items-center">
+                                        <span class="text-muted fw-semibold">Jetson CPU Load</span>
+                                        <span id="val-cpu" class="badge bg-success fs-6">0%</span>
+                                    </div>
+                                    <div class="progress mb-3" style="height: 6px;">
+                                        <div id="progress-cpu" class="progress-bar bg-success" role="progressbar" style="width: 0%"></div>
+                                    </div>
+
+                                    <!-- Jetson RAM & Temp -->
+                                    <div class="d-flex justify-content-between mt-2 pt-2 border-top">
+                                        <div>
+                                            <span class="text-muted small fw-semibold d-block">Jetson RAM</span>
+                                            <span id="val-ram" class="fw-bold">0%</span>
+                                        </div>
+                                        <div class="text-end">
+                                            <span class="text-muted small fw-semibold d-block">Nhiệt độ</span>
+                                            <span id="val-temp" class="fw-bold">0°C</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Bảng tính năng điều khiển -->
+                        <div class="card shadow-sm border-0">
+                            <div class="card-header bg-white border-bottom fw-bold text-primary">
+                                TÍNH NĂNG ĐIỀU KHIỂN
+                            </div>
+                            <div class="card-body">
+                                <div class="d-grid gap-2">
+                                    <button id="btn-capture" class="btn btn-outline-success text-start">
+                                        Chụp ảnh
+                                    </button>
+                                    <button class="btn btn-outline-info text-start">
+                                        Xem danh sách định danh
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- VIEW 2: MODULE CHỤP ẢNH ĐĂNG KÝ (Ẩn mặc định) -->
+                <div class="row g-3 d-none" id="view-registration">
+                    <div class="col-12">
+                        <div class="card shadow-sm border-0">
+                            <div class="card-header bg-primary text-white py-3">
+                                <h5 class="mb-0 fw-bold">Chụp ảnh đăng ký khuôn mặt</h5>
+                            </div>
+                            <div class="card-body p-4">
+                                <div class="row g-4">
+                                    <!-- Cột trái: Nhập tên & Camera live stream -->
+                                    <div class="col-lg-7 col-md-12 border-end pe-lg-4">
+                                        <div class="mb-4">
+                                            <label for="reg-username" class="form-label fw-bold text-dark fs-6">Tên / ID người dùng</label>
+                                            <input type="text" class="form-control form-control-lg" id="reg-username" placeholder="Ví dụ: Nguyen_Van_A" style="border-radius: 8px;">
+                                        </div>
+                                        
+                                        <!-- Video feed từ camera laptop -->
+                                        <div class="bg-black text-center rounded position-relative overflow-hidden mb-4 shadow-inner" style="aspect-ratio: 16/9; max-height: 400px; border: 2px solid #e2e8f0;">
+                                            <video id="webcam-video" autoplay playsinline class="w-100 h-100" style="object-fit: cover; transform: scaleX(-1);"></video>
+                                            <canvas id="webcam-canvas" class="d-none"></canvas>
+                                            
+                                            <!-- Khung hướng dẫn đặt khuôn mặt -->
+                                            <div class="position-absolute top-50 start-50 translate-middle border border-warning border-3 rounded-circle" style="width: 200px; height: 260px; pointer-events: none; opacity: 0.75; border-style: dashed !important;">
+                                                <div class="position-absolute bottom-0 start-50 translate-middle-x bg-warning text-dark px-3 py-1 rounded-pill fw-bold" style="white-space: nowrap; font-size: 11px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">
+                                                    Đặt khuôn mặt vào đây
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <!-- Nút Chụp ảnh điều khiển theo từng bước -->
+                                        <div class="text-center bg-light p-3 rounded-3 mb-2">
+                                            <h5 class="fw-bold text-primary mb-3" id="step-instruction">Bước 1: Chụp ảnh trước mặt</h5>
+                                            <div class="d-flex justify-content-center gap-3">
+                                                <button id="btn-reg-capture" class="btn btn-primary btn-lg px-4 py-2.5 fw-bold shadow-sm" style="border-radius: 8px; min-width: 220px;">
+                                                    Chụp ảnh trước mặt
+                                                </button>
+                                                <button id="btn-reg-reset" class="btn btn-outline-secondary btn-lg px-4 py-2.5 fw-bold d-none" style="border-radius: 8px;">
+                                                    Chụp lại từ đầu
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <!-- Cột phải: 3 ảnh preview xem trước và nút Lưu -->
+                                    <div class="col-lg-5 col-md-12 d-flex flex-column justify-content-between ps-lg-4">
+                                        <div>
+                                            <h6 class="fw-bold text-dark fs-6 mb-3">Hình ảnh đã chụp (Preview)</h6>
+                                            
+                                            <div class="row g-3 text-center">
+                                                <!-- Preview 1: Trước mặt -->
+                                                <div class="col-4">
+                                                    <div class="border rounded bg-light p-1 position-relative d-flex align-items-center justify-content-center shadow-sm" style="aspect-ratio: 3/4; overflow: hidden; border-color: #cbd5e1 !important;">
+                                                        <div class="text-muted small px-1" id="preview-front-placeholder" style="font-size: 11px;">
+                                                            Trước mặt
+                                                        </div>
+                                                        <img id="preview-front" class="w-100 h-100 rounded d-none" style="object-fit: cover;">
+                                                    </div>
+                                                    <span class="text-dark fw-semibold small d-block mt-2">Trước mặt</span>
+                                                </div>
+                                                
+                                                <!-- Preview 2: Quay trái -->
+                                                <div class="col-4">
+                                                    <div class="border rounded bg-light p-1 position-relative d-flex align-items-center justify-content-center shadow-sm" style="aspect-ratio: 3/4; overflow: hidden; border-color: #cbd5e1 !important;">
+                                                        <div class="text-muted small px-1" id="preview-left-placeholder" style="font-size: 11px;">
+                                                            Nghiêng trái
+                                                        </div>
+                                                        <img id="preview-left" class="w-100 h-100 rounded d-none" style="object-fit: cover;">
+                                                    </div>
+                                                    <span class="text-dark fw-semibold small d-block mt-2">Quay trái</span>
+                                                </div>
+                                                
+                                                <!-- Preview 3: Quay phải -->
+                                                <div class="col-4">
+                                                    <div class="border rounded bg-light p-1 position-relative d-flex align-items-center justify-content-center shadow-sm" style="aspect-ratio: 3/4; overflow: hidden; border-color: #cbd5e1 !important;">
+                                                        <div class="text-muted small px-1" id="preview-right-placeholder" style="font-size: 11px;">
+                                                            Nghiêng phải
+                                                        </div>
+                                                        <img id="preview-right" class="w-100 h-100 rounded d-none" style="object-fit: cover;">
+                                                    </div>
+                                                    <span class="text-dark fw-semibold small d-block mt-2">Quay phải</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <!-- Nút hành động Lưu -->
+                                        <div class="mt-5 pt-4 border-top">
+                                            <button id="btn-reg-save" class="btn btn-success btn-lg py-3 fw-bold w-100 shadow-sm" style="border-radius: 8px;" disabled>
+                                                Lưu bộ ảnh
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Preview Ảnh Chụp (Snapshot Preview Modal) -->
+    <div class="modal fade" id="capturePreviewModal" tabindex="-1" aria-labelledby="capturePreviewModalLabel" aria-hidden="true" data-bs-backdrop="static">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content shadow border-0" style="border-radius: 12px;">
+                <div class="modal-header bg-primary text-white py-3" style="border-top-left-radius: 12px; border-top-right-radius: 12px;">
+                    <h5 class="modal-title fw-bold" id="capturePreviewModalLabel">
+                        <i class="fas fa-camera me-2"></i>Xem trước ảnh chụp
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close" id="btn-close-modal"></button>
+                </div>
+                <div class="modal-body p-4 bg-light">
+                    <p class="text-muted fw-semibold mb-3 text-center" id="preview-modal-info">
+                        Đang xử lý hình ảnh...
+                    </p>
+                    
+                    <!-- Vùng hiển thị ảnh preview -->
+                    <div id="preview-images-container" class="row g-3 justify-content-center">
+                        <!-- Ảnh sẽ được thêm động bằng JS ở đây -->
+                    </div>
+                </div>
+                <div class="modal-footer bg-white py-3 border-top-0 d-flex justify-content-center gap-3">
+                    <button type="button" class="btn btn-outline-danger px-4 py-2.5 fw-bold" id="btn-preview-delete" style="border-radius: 8px;">
+                        <i class="fas fa-trash-alt me-2"></i>Xóa / Hủy bỏ
+                    </button>
+                    <button type="button" class="btn btn-success px-4 py-2.5 fw-bold" id="btn-preview-save" style="border-radius: 8px;">
+                        <i class="fas fa-save me-2"></i>Lưu hình ảnh
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <!-- Script xử lý các nút bấm -->
+    <script>
+        let activeCamera = "camera_1";
+
+        // DOM elements
+        const cameraButtons = document.querySelectorAll('[data-camera]');
+        const videoFeed = document.querySelector('.video-feed');
+        const viewMonitoring = document.getElementById('view-monitoring');
+        const viewRegistration = document.getElementById('view-registration');
+        const btnNavRegister = document.getElementById('btn-nav-register');
+        
+        // Webcam state variables
+        let webcamStream = null;
+        const webcamVideo = document.getElementById('webcam-video');
+        const webcamCanvas = document.getElementById('webcam-canvas');
+        
+        const poses = ['front', 'left', 'right'];
+        const poseLabels = {
+            'front': 'Trước mặt',
+            'left': 'Quay sang trái',
+            'right': 'Quay sang phải'
+        };
+        let currentPoseIndex = 0;
+        let capturedImages = {
+            'front': null,
+            'left': null,
+            'right': null
+        };
+
+        // Hàm đổi luồng camera
+        function setCameraStream(cameraId) {
+            activeCamera = cameraId;
+            videoFeed.src = `/video_feed/${cameraId}?t=` + new Date().getTime();
+        }
+
+        // Tự động thử lại khi luồng bị lỗi hoặc chưa khởi động kịp
+        videoFeed.onerror = function() {
+            if (!viewMonitoring.classList.contains('d-none')) {
+                console.log("Mất kết nối camera. Thử lại sau 2 giây...");
+                setTimeout(() => {
+                    videoFeed.src = `/video_feed/${activeCamera}?t=` + new Date().getTime();
+                }, 2000);
+            }
+        };
+
+        // Switch to Monitoring View
+        function showMonitoringView() {
+            viewMonitoring.classList.remove('d-none');
+            viewRegistration.classList.add('d-none');
+            
+            // Restore active state to selected camera button
+            cameraButtons.forEach(btn => {
+                if (btn.getAttribute('data-camera') === activeCamera) {
+                    btn.classList.add('active');
+                    btn.classList.remove('text-muted');
+                } else {
+                    btn.classList.remove('active');
+                    btn.classList.add('text-muted');
+                }
+            });
+            
+            btnNavRegister.classList.remove('active', 'btn-primary');
+            btnNavRegister.classList.add('btn-outline-primary');
+            
+            // Stop webcam stream
+            stopWebcam();
+        }
+
+        // Switch to Registration View
+        function showRegistrationView() {
+            viewMonitoring.classList.add('d-none');
+            viewRegistration.classList.remove('d-none');
+            
+            // Deactivate all camera buttons
+            cameraButtons.forEach(btn => {
+                btn.classList.remove('active');
+                btn.classList.add('text-muted');
+            });
+            
+            btnNavRegister.classList.add('active', 'btn-primary');
+            btnNavRegister.classList.remove('btn-outline-primary');
+            
+            // Start webcam stream
+            startWebcam();
+        }
+
+        // Webcam stream functions
+        async function startWebcam() {
+            try {
+                webcamStream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 1280, height: 720, facingMode: 'user' }
+                });
+                webcamVideo.srcObject = webcamStream;
+            } catch (err) {
+                console.error("Lỗi mở webcam laptop:", err);
+                alert("Không thể kết nối webcam laptop của bạn. Vui lòng cấp quyền camera cho trình duyệt.");
+                showMonitoringView();
+            }
+        }
+
+        function stopWebcam() {
+            if (webcamStream) {
+                webcamStream.getTracks().forEach(track => track.stop());
+                webcamStream = null;
+            }
+            webcamVideo.srcObject = null;
+        }
+
+        // Click nav handlers
+        btnNavRegister.addEventListener('click', showRegistrationView);
+
+        cameraButtons.forEach(button => {
+            button.addEventListener('click', function() {
+                // Đổi active button style
+                cameraButtons.forEach(btn => {
+                    btn.classList.remove('active');
+                    btn.classList.add('text-muted');
+                });
+                this.classList.add('active');
+                this.classList.remove('text-muted');
+                
+                // Đổi tên camera hiển thị
+                const cameraName = this.querySelector('span').innerText.trim();
+                document.querySelector('.video-card .card-header span').innerText = `Trực tiếp: ${cameraName}`;
+                
+                // Đổi luồng và chuyển view
+                setCameraStream(this.getAttribute('data-camera'));
+                showMonitoringView();
+            });
+        });
+
+        // Face registration process
+        const btnRegCapture = document.getElementById('btn-reg-capture');
+        const btnRegReset = document.getElementById('btn-reg-reset');
+        const btnRegSave = document.getElementById('btn-reg-save');
+        const stepInstruction = document.getElementById('step-instruction');
+        const regUsername = document.getElementById('reg-username');
+
+        btnRegCapture.addEventListener('click', function() {
+            if (!webcamStream) return;
+            
+            const username = regUsername.value.trim();
+            if (!username) {
+                alert("Vui lòng nhập Tên / ID người dùng trước khi tiến hành chụp ảnh.");
+                regUsername.focus();
+                return;
+            }
+            
+            const currentPose = poses[currentPoseIndex];
+            
+            // Draw to canvas
+            const context = webcamCanvas.getContext('2d');
+            webcamCanvas.width = webcamVideo.videoWidth || 640;
+            webcamCanvas.height = webcamVideo.videoHeight || 480;
+            
+            // Draw mirrored image
+            context.translate(webcamCanvas.width, 0);
+            context.scale(-1, 1);
+            context.drawImage(webcamVideo, 0, 0, webcamCanvas.width, webcamCanvas.height);
+            
+            // Base64 image
+            const imgData = webcamCanvas.toDataURL('image/jpeg', 0.9);
+            capturedImages[currentPose] = imgData;
+            
+            // Display preview image
+            const imgElement = document.getElementById(`preview-${currentPose}`);
+            const placeholder = document.getElementById(`preview-${currentPose}-placeholder`);
+            imgElement.src = imgData;
+            imgElement.classList.remove('d-none');
+            placeholder.classList.add('d-none');
+            
+            // Next step setup
+            currentPoseIndex++;
+            btnRegReset.classList.remove('d-none');
+            
+            if (currentPoseIndex < poses.length) {
+                const nextPose = poses[currentPoseIndex];
+                stepInstruction.innerText = `Bước ${currentPoseIndex + 1}: Chụp ảnh ${poseLabels[nextPose].toLowerCase()}`;
+                btnRegCapture.innerText = `Chụp ảnh ${poseLabels[nextPose].toLowerCase()}`;
+            } else {
+                stepInstruction.innerText = "Chụp đủ 3 kiểu. Hãy nhấn Lưu bộ ảnh";
+                btnRegCapture.innerText = "Hoàn tất các bước chụp";
+                btnRegCapture.disabled = true;
+                btnRegSave.disabled = false;
+            }
+        });
+
+        btnRegReset.addEventListener('click', function() {
+            currentPoseIndex = 0;
+            capturedImages = { 'front': null, 'left': null, 'right': null };
+            
+            poses.forEach(pose => {
+                const imgElement = document.getElementById(`preview-${pose}`);
+                const placeholder = document.getElementById(`preview-${pose}-placeholder`);
+                imgElement.src = '';
+                imgElement.classList.add('d-none');
+                placeholder.classList.remove('d-none');
+            });
+            
+            stepInstruction.innerText = "Bước 1: Chụp ảnh trước mặt";
+            btnRegCapture.innerText = "Chụp ảnh trước mặt";
+            btnRegCapture.disabled = false;
+            btnRegReset.classList.add('d-none');
+            btnRegSave.disabled = true;
+        });
+
+        btnRegSave.addEventListener('click', function() {
+            const username = regUsername.value.trim();
+            if (!username) {
+                alert("Vui lòng nhập Tên / ID người dùng.");
+                return;
+            }
+            
+            btnRegSave.disabled = true;
+            btnRegSave.innerText = "Đang lưu bộ ảnh...";
+            
+            fetch('/api/register_face', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    username: username,
+                    front: capturedImages['front'],
+                    left: capturedImages['left'],
+                    right: capturedImages['right']
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    alert(data.message);
+                    regUsername.value = '';
+                    btnRegReset.click();
+                    showMonitoringView();
+                } else {
+                    alert("Lỗi: " + data.message);
+                    btnRegSave.disabled = false;
+                    btnRegSave.innerText = "Lưu bộ ảnh";
+                }
+            })
+            .catch(err => {
+                console.error("Lỗi lưu ảnh đăng ký:", err);
+                alert("Không thể lưu ảnh đăng ký. Lỗi kết nối server.");
+                btnRegSave.disabled = false;
+                btnRegSave.innerText = "Lưu bộ ảnh";
+            });
+        });
+
+        // Biến lưu trữ trạng thái chụp ảnh tạm thời để hiển thị preview
+        let pendingCaptureData = [];
+        let pendingCameraId = "";
+        let previewModal = null;
+
+        // Xử lý nút Chụp ảnh (Mặc định ngoài màn hình chính)
+        document.getElementById('btn-capture').addEventListener('click', function() {
+            const btn = this;
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Đang xử lý...';
+            btn.disabled = true;
+
+            fetch(`/api/capture_preview/${activeCamera}`, { method: 'POST' })
+            .then(response => response.json())
+            .then(data => {
+                if(data.status === 'success') {
+                    pendingCaptureData = data.images;
+                    pendingCameraId = data.camera_id;
+
+                    // Khởi tạo Bootstrap Modal
+                    if (!previewModal) {
+                        previewModal = new bootstrap.Modal(document.getElementById('capturePreviewModal'));
+                    }
+                    
+                    const container = document.getElementById('preview-images-container');
+                    const infoText = document.getElementById('preview-modal-info');
+                    container.innerHTML = ''; // Xóa sạch dữ liệu cũ
+
+                    const isFace = pendingCaptureData[0].type === 'face';
+                    if (isFace) {
+                        infoText.innerText = `Phát hiện thấy ${pendingCaptureData.length} khuôn mặt từ Camera. Bạn muốn lưu hay xóa?`;
+                    } else {
+                        infoText.innerText = `Không tìm thấy khuôn mặt nào. Bạn có muốn lưu lại toàn bộ khung hình không?`;
+                    }
+
+                    pendingCaptureData.forEach((imgObj, idx) => {
+                        const colSize = isFace ? "col-md-4 col-sm-6 text-center" : "col-12 text-center";
+                        const cardHtml = `
+                            <div class="${colSize}">
+                                <div class="card shadow-sm border-0 h-100 bg-white" style="border-radius: 8px; overflow: hidden;">
+                                    <div class="p-2 bg-dark d-flex align-items-center justify-content-center" style="aspect-ratio: 1/1; max-height: 250px;">
+                                        <img src="${imgObj.data}" class="rounded" style="width: 100%; height: 100%; object-fit: contain;">
+                                    </div>
+                                    <div class="card-footer bg-white border-0 py-2">
+                                        <select class="form-select form-select-sm text-center face-name-input" data-idx="${idx}">
+                                            <option value="Unknown" selected>-- Chọn tên --</option>
+                                            <option value="Le_Thien_Phuc">Le_Thien_Phuc</option>
+                                            <option value="Nguyen_Thanh_Binh">Nguyen_Thanh_Binh</option>
+                                            <option value="Hoang_Nhat_Nam">Hoang_Nhat_Nam</option>
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                        container.insertAdjacentHTML('beforeend', cardHtml);
+                    });
+
+                    // Đăng ký nút Close ở góc phải trên cùng modal
+                    document.getElementById('btn-close-modal').onclick = function() {
+                        previewModal.hide();
+                    };
+
+                    previewModal.show();
+                } else {
+                    alert('❌ Lỗi: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Lỗi:', error);
+                alert('❌ Không thể kết nối tới server.');
+            })
+            .finally(() => {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            });
+        });
+
+        // Xử lý nút Hủy / Xóa trong Modal
+        document.getElementById('btn-preview-delete').addEventListener('click', function() {
+            if (previewModal) {
+                previewModal.hide();
+                // Hiển thị alert thông báo hủy bỏ thành công
+                alert('🗑️ Đã hủy bỏ và xóa ảnh xem trước.');
+            }
+        });
+
+        // Xử lý nút Lưu hình ảnh trong Modal
+        document.getElementById('btn-preview-save').addEventListener('click', function() {
+            const btn = this;
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Đang lưu...';
+            btn.disabled = true;
+
+            // Lấy tên từ các ô input
+            const inputs = document.querySelectorAll('.face-name-input');
+            inputs.forEach(input => {
+                const idx = parseInt(input.getAttribute('data-idx'));
+                if (input.value.trim() !== '') {
+                    pendingCaptureData[idx].label = input.value.trim();
+                } else {
+                    pendingCaptureData[idx].label = 'Unknown';
+                }
+            });
+
+            fetch('/api/save_captured_images', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    camera_id: pendingCameraId,
+                    images: pendingCaptureData
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    if (previewModal) {
+                        previewModal.hide();
+                    }
+                    alert('💾 ' + data.message);
+                } else {
+                    alert('❌ Lỗi: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Lỗi lưu ảnh:', error);
+                alert('❌ Không thể kết nối tới server để lưu ảnh.');
+            })
+            .finally(() => {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            });
+        });
+
+        // Hàm cập nhật benchmark từ API
+        function updateStats() {
+            fetch('/api/stats')
+            .then(response => response.json())
+            .then(data => {
+                // Cập nhật thông số Camera hiện tại đang được chọn
+                const camData = data.cameras[activeCamera];
+                if (camData) {
+                    const fps = camData.fps;
+                    document.getElementById('val-fps').innerText = fps;
+                    const fpsPercent = Math.min(100, (fps / 30) * 100);
+                    document.getElementById('progress-fps').style.width = fpsPercent + '%';
+                    
+                    document.getElementById('val-resolution').innerText = `Độ phân giải: ${camData.resolution}`;
+                }
+                
+                // Cập nhật thông số Jetson
+                const jetson = data.jetson;
+                
+                // Cập nhật Ping độc lập với Stats Server
+                if (jetson.latency > 0) {
+                    document.getElementById('val-latency').innerText = jetson.latency + ' ms';
+                    const latPercent = Math.min(100, (jetson.latency / 200) * 100);
+                    document.getElementById('progress-latency').style.width = latPercent + '%';
+                } else {
+                    document.getElementById('val-latency').innerText = 'Offline';
+                    document.getElementById('progress-latency').style.width = '0%';
+                }
+
+                if (jetson.online) {
+                    document.getElementById('val-cpu').innerText = jetson.cpu + '%';
+                    document.getElementById('progress-cpu').style.width = jetson.cpu + '%';
+                    document.getElementById('val-ram').innerText = jetson.ram + '%';
+                    document.getElementById('val-temp').innerText = jetson.temp + '°C';
+                } else {
+                    document.getElementById('val-cpu').innerText = '0%';
+                    document.getElementById('progress-cpu').style.width = '0%';
+                    document.getElementById('val-ram').innerText = '0%';
+                    document.getElementById('val-temp').innerText = '0°C';
+                }
+
+                // Cập nhật trạng thái của tất cả các nút Camera trong danh sách
+                for (const camId in data.cameras) {
+                    const status = data.cameras[camId].status;
+                    const btn = document.querySelector(`[data-camera="${camId}"]`);
+                    if (btn) {
+                        const badge = btn.querySelector('.status-badge');
+                        if (badge) {
+                            badge.innerText = status;
+                            if (status === 'Online') {
+                                badge.className = 'badge bg-success rounded-pill status-badge';
+                            } else if (status === 'Connecting') {
+                                badge.className = 'badge bg-warning text-dark rounded-pill status-badge';
+                            } else {
+                                badge.className = 'badge bg-secondary rounded-pill status-badge';
+                            }
+                        }
+                    }
+                }
+            })
+            .catch(err => console.error('Error fetching stats:', err));
+        }
+
+        // Cập nhật mỗi 1 giây
+        setInterval(updateStats, 1000);
+        updateStats();
+    </script>
+</body>
+</html>

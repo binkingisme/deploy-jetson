@@ -1,0 +1,316 @@
+"""SCRFD det_10g output decoder (pure NumPy, no DeepStream dependency).
+
+The primary GIE runs the SCRFD ``det_10g`` ONNX -> TensorRT engine with
+``output-tensor-meta=1``, so DeepStream does NOT parse boxes. The 9 raw
+output tensors are exposed as layer info and this module decodes them into
+faces using the canonical InsightFace SCRFD anchor decode + class-agnostic NMS.
+
+Runtime layout of the engine (strides 8/16/32, 2 anchors per cell):
+  score_8/16/32 : (1, S*S*2, 1)
+  bbox_8/16/32  : (1, S*S*2, 4)   distance-to-box in [0,1], scaled by stride
+  kps_8/16/32   : (1, S*S*2, 10)  distance-to-keypoints, scaled by stride
+
+This module is kept free of pyds/Gst so it runs in unit tests on any host.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from .detector import Detection
+
+
+@dataclass
+class ScrfConfig:
+    """SCRFD anchor geometry for det_10g."""
+
+    input_h: int = 640
+    input_w: int = 640
+    strides: tuple[int, ...] = (8, 16, 32)
+    num_anchors: int = 2
+    score_threshold: float = 0.5
+    nms_threshold: float = 0.4
+    max_cells_per_stride: int = 1024
+
+
+def _score_key(name: str) -> str | None:
+    n = (name or "").lower()
+    if "score" in n:
+        return "score"
+    if "bbox" in n or "box" in n:
+        return "bbox"
+    if "kps" in n or "kps" in n or "landmark" in n:
+        return "kps"
+    return None
+
+
+def _stride_key(name: str) -> int | None:
+    n = (name or "").lower()
+    for s in ("8", "16", "32"):
+        # match suffix like score_8 / score8 / 8
+        if n.endswith(s) or f"_{s}" in n:
+            return int(s)
+    return None
+
+
+def _distance2bbox(points: np.ndarray, distance: np.ndarray) -> np.ndarray:
+    """Convert center + distances to [x1, y1, x2, y2] boxes."""
+    x1 = points[:, 0] - distance[:, 0]
+    y1 = points[:, 1] - distance[:, 1]
+    x2 = points[:, 0] + distance[:, 2]
+    y2 = points[:, 1] + distance[:, 3]
+    return np.stack([x1, y1, x2, y2], axis=-1)
+
+
+def _distance2kps(points: np.ndarray, distance: np.ndarray) -> np.ndarray:
+    """Convert center + distances to 5 keypoint (x, y) pairs."""
+    preds = [None] * distance.shape[1]
+    for i in range(0, distance.shape[1], 2):
+        preds[i] = points[:, 0] + distance[:, i]
+        preds[i + 1] = points[:, 1] + distance[:, i + 1]
+    return np.stack(preds, axis=-1)
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid."""
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30.0, 30.0)))
+
+
+def _nms(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> np.ndarray:
+    """Class-agnostic greedy NMS. boxes: (N,4) [x1,y1,x2,y2]; returns mask."""
+    order = np.argsort(-scores)
+    keep: list[int] = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        if order.size == 1:
+            break
+        xx1 = np.maximum(boxes[i, 0], boxes[order[1:], 0])
+        yy1 = np.maximum(boxes[i, 1], boxes[order[1:], 1])
+        xx2 = np.minimum(boxes[i, 2], boxes[order[1:], 2])
+        yy2 = np.minimum(boxes[i, 3], boxes[order[1:], 3])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        iou = inter / (
+            (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
+            + 1e-12
+        )
+        order = np.delete(
+            order, np.concatenate(([0], np.where(iou > threshold)[0] + 1))
+        )
+    return np.asarray(keep, dtype=np.int64)
+
+
+class SCRFDParser:
+    """Decodes SCRFD tensor outputs into Detection objects.
+
+    Usage from a DeepStream probe: build a ``{layer_name: np.ndarray}`` dict
+    from the NvDsInferTensorMeta layers (see engine.py), then call
+    ``parse(name_map)``. Tensor arrays may be any dims; they are flattened to
+    (N, C) by the number of anchors reported in the name/shape.
+    """
+
+    def __init__(self, config: ScrfConfig | None = None):
+        self.config = config or ScrfConfig()
+
+    # ------------------------------------------------------------------
+    # anchors
+    def _anchors_for(self, stride: int) -> np.ndarray:
+        h = self.config.input_h // stride
+        w = self.config.input_w // stride
+        # insightface SCRFD anchor centers: grid index * stride (NO +0.5).
+        # Order must match the engine's output layout: cell-major then
+        # anchors-per-cell, i.e. (0,0)->(0,0), (1,0)->(1,0), ...
+        ys, xs = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+        centers = (np.stack([xs, ys], axis=-1).reshape(-1, 2)) * stride
+        if self.config.num_anchors > 1:
+            # two anchors per cell share the same center; duplicating in
+            # cell-major order keeps parity with bbox_preds rows
+            centers = np.repeat(centers, self.config.num_anchors, axis=0)
+        return centers.astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # tensor collection / validation
+    def collect(self, layers: list) -> dict[str, np.ndarray]:
+        """Group arbitrary NvDsInferLayerInfo objects into name -> array.
+
+        ``layers`` items need only expose ``.layerName`` and ``.dims`` and be
+        convertible via the engine helper to a numpy array. Kept duck-typed so
+        the production probe can pass pyds LayerInfo directly.
+        """
+        out: dict[str, np.ndarray] = {}
+        for li in layers:
+            if not getattr(li, "layerName", None):
+                continue
+            arr = self._layer_to_array(li)
+            if arr is not None:
+                out[str(li.layerName)] = arr
+        return out
+
+    @staticmethod
+    def _layer_to_array(li: object) -> np.ndarray | None:
+        try:
+            if hasattr(li, "as_numpy"):
+                return li.as_numpy()
+            buffer = getattr(li, "buffer", None)
+            dims = getattr(li, "dims", None)
+            if buffer is None or dims is None:
+                return None
+            return np.array(buffer, copy=True).reshape(
+                [dims.d[d] for d in range(dims.numDims)]
+            )
+        except Exception:
+            return None
+
+    def parse(self, tensors: dict[str, np.ndarray]) -> list[Detection]:
+        """Decode the 9 output tensors into a list of Detection (frame px)."""
+        cfg = self.config
+        if not tensors:
+            return []
+
+        score_arrs: dict[int, np.ndarray] = {}
+        bbox_arrs: dict[int, np.ndarray] = {}
+        kps_arrs: dict[int, np.ndarray] = {}
+
+        matched_score, matched_bbox, matched_kps = 0, 0, 0
+        for name, arr in tensors.items():
+            kind = _score_key(name) or ""
+            stride = _stride_key(name)
+            if stride not in cfg.strides:
+                continue
+            flat = np.array(arr, dtype=np.float32).reshape(-1)
+            if kind == "score":
+                score_arrs[stride] = flat
+                matched_score += 1
+            elif kind == "bbox":
+                bbox_arrs[stride] = flat
+                matched_bbox += 1
+            elif kind == "kps":
+                kps_arrs[stride] = flat
+                matched_kps += 1
+
+        # name-based matching failed -> fall back to positional stride order
+        if matched_score < 3 or matched_bbox < 3:
+            score_arrs, bbox_arrs, kps_arrs = self._positional_fallback(tensors)
+
+        all_boxes: list[np.ndarray] = []
+        all_scores: list[np.ndarray] = []
+        all_kps: list[np.ndarray] = []
+
+        for stride in cfg.strides:
+            score = score_arrs.get(stride)
+            bbox = bbox_arrs.get(stride)
+            if score is None or bbox is None:
+                raise ValueError(
+                    f"SCRFD tensor missing for stride={stride} "
+                    f"(got scores={sorted(score_arrs)}, "
+                    f"bboxes={sorted(bbox_arrs)})"
+                )
+            anchors = self._anchors_for(stride)
+
+            n_anch = anchors.shape[0]
+            score_raw = score[: n_anch * 1].reshape(-1)
+            # det_10g ONNX already ends with a Sigmoid on the score head, so
+            # score_raw is a probability in [0, 1]. Some TRT builds keep that,
+            # others fold it back to logits. Detect once: if any value exceeds
+            # 1.0 the tensor holds logits and needs a sigmoid.
+            if float(score_raw.max()) > 1.0:
+                score2 = _sigmoid(score_raw)
+            else:
+                score2 = score_raw
+            bbox2 = bbox[: n_anch * 4].reshape(n_anch, 4)
+            kps2 = (
+                kps_arrs.get(stride)
+                if stride in kps_arrs
+                else np.zeros((n_anch, 10), dtype=np.float32)
+            )
+
+            keep = np.where(score2 >= cfg.score_threshold)[0]
+            if keep.size > cfg.max_cells_per_stride:
+                # cap NMS workload: keep the strongest max_cells_per_stride
+                # cells per stride (background logits sit ~0 -> sigmoid~0.5,
+                # so a raw threshold alone would pass thousands of cells).
+                top = np.argpartition(score2[keep], -cfg.max_cells_per_stride)[
+                    -cfg.max_cells_per_stride :
+                ]
+                keep = keep[top]
+            if keep.size == 0:
+                continue
+
+            kps3 = np.zeros((n_anch, 10), dtype=np.float32)
+            if kps2.size:
+                kps3 = kps2.reshape(n_anch, 10)
+
+            dist_bbox = bbox2 * stride
+            boxes = _distance2bbox(anchors, dist_bbox)   # [x1,y1,x2,y2] input px
+            dist_kps = kps3 * stride
+            kps_all = _distance2kps(anchors, dist_kps)   # 10 cols
+
+            sub_boxes = boxes[keep]
+            sub_scores = score2[keep]
+            sub_kps = kps_all[keep]
+            # clip to input frame
+            sub_boxes[:, [0, 2]] = np.clip(
+                sub_boxes[:, [0, 2]], 0, cfg.input_w
+            )
+            sub_boxes[:, [1, 3]] = np.clip(
+                sub_boxes[:, [1, 3]], 0, cfg.input_h
+            )
+            sub_boxes[:, 2] = np.maximum(sub_boxes[:, 2], sub_boxes[:, 0])
+            sub_boxes[:, 3] = np.maximum(sub_boxes[:, 3], sub_boxes[:, 1])
+
+            # per-stride NMS
+            keep2 = _nms(sub_boxes, sub_scores, cfg.nms_threshold)
+            all_boxes.append(sub_boxes[keep2])
+            all_scores.append(sub_scores[keep2])
+            all_kps.append(sub_kps[keep2])
+
+        if not all_boxes:
+            return []
+
+        boxes = np.concatenate(all_boxes, axis=0)
+        scores = np.concatenate(all_scores, axis=0)
+        kps = np.concatenate(all_kps, axis=0) if all_kps else None
+
+        # global NMS across strides
+        keep = _nms(boxes, scores, cfg.nms_threshold)
+
+        dets: list[Detection] = []
+        for i in keep:
+            x1, y1, x2, y2 = boxes[i]
+            lm = None
+            if kps is not None and len(kps) > i:
+                lm = kps[i].reshape(5, 2).astype(np.float32)
+            dets.append(
+                Detection(
+                    bbox=(float(x1), float(y1), float(x2 - x1), float(y2 - y1)),
+                    confidence=float(scores[i]),
+                    class_id=0,
+                    frame_id=0,
+                    landmarks=lm,
+                )
+            )
+        return dets
+
+    def _positional_fallback(
+        self, tensors: dict[str, np.ndarray]
+    ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, np.ndarray]]:
+        """Assume outputs ordered [score, bbox, kps] x [8,16,32]."""
+        cfg = self.config
+        stride_order = dict(zip(range(3), cfg.strides))
+        arrays = [np.array(a, dtype=np.float32).reshape(-1) for a in tensors.values()]
+        arrays = arrays[:9]  # safety: use first 9 in given order
+        if len(arrays) < 6:
+            raise ValueError(
+                f"SCRFD expected >=6 output tensors, got {len(arrays)}"
+            )
+
+        def group(base: int) -> dict[int, np.ndarray]:
+            return {stride_order[i]: arrays[base + i] for i in range(3)}
+
+        score_map = group(0)
+        bbox_map = group(3)
+        kps_map: dict[int, np.ndarray] = {}
+        if len(arrays) >= 9:
+            kps_map = group(6)
+        return score_map, bbox_map, kps_map
